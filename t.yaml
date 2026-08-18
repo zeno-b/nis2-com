@@ -1,0 +1,197 @@
+id: t-default-nis2-headers
+
+info:
+  name: NIS2 default passive single-GET web baseline
+  author: nis2-scanner
+  severity: low
+  description: |
+    Default Nuclei template used by scanner.py when no --templates argument is
+    supplied. It performs one passive GET against the target root and flags
+    common missing or weak HTTP headers, cookie attributes, disclosure headers,
+    permissive CORS, generator/default-page fingerprints, and other observations
+    visible from that single response. Purely passive: no payloads, fuzzing, or
+    intrusive requests are sent.
+  tags: misc,headers,nis2,passive,baseline
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    redirects: true
+    max-redirects: 2
+    matchers-condition: or
+    matchers:
+      - type: dsl
+        name: missing-strict-transport-security
+        dsl:
+          - "!contains(tolower(all_headers), 'strict-transport-security')"
+
+      - type: dsl
+        name: hsts-without-includesubdomains
+        dsl:
+          - "contains(tolower(all_headers), 'strict-transport-security') && !contains(tolower(all_headers), 'includesubdomains')"
+
+      - type: dsl
+        name: hsts-without-preload
+        dsl:
+          - "contains(tolower(all_headers), 'strict-transport-security') && !contains(tolower(all_headers), 'preload')"
+
+      - type: dsl
+        name: missing-content-security-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'content-security-policy')"
+
+      - type: dsl
+        name: content-security-policy-unsafe-inline
+        dsl:
+          - "contains(tolower(all_headers), 'content-security-policy') && contains(tolower(all_headers), 'unsafe-inline')"
+
+      - type: dsl
+        name: content-security-policy-unsafe-eval
+        dsl:
+          - "contains(tolower(all_headers), 'content-security-policy') && contains(tolower(all_headers), 'unsafe-eval')"
+
+      - type: dsl
+        name: content-security-policy-wildcard-source
+        dsl:
+          - "contains(tolower(all_headers), 'content-security-policy') && contains(tolower(all_headers), ' *')"
+
+      - type: dsl
+        name: content-security-policy-allows-http
+        dsl:
+          - "contains(tolower(all_headers), 'content-security-policy') && contains(tolower(all_headers), 'http:')"
+
+      - type: dsl
+        name: missing-x-frame-options
+        dsl:
+          - "!contains(tolower(all_headers), 'x-frame-options')"
+
+      - type: dsl
+        name: x-frame-options-allowall
+        dsl:
+          - "contains(tolower(all_headers), 'x-frame-options: allowall')"
+
+      - type: dsl
+        name: missing-x-content-type-options
+        dsl:
+          - "!contains(tolower(all_headers), 'x-content-type-options')"
+
+      - type: dsl
+        name: x-content-type-options-not-nosniff
+        dsl:
+          - "contains(tolower(all_headers), 'x-content-type-options') && !contains(tolower(all_headers), 'nosniff')"
+
+      - type: dsl
+        name: missing-referrer-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'referrer-policy')"
+
+      - type: dsl
+        name: referrer-policy-unsafe-url
+        dsl:
+          - "contains(tolower(all_headers), 'referrer-policy: unsafe-url')"
+
+      - type: dsl
+        name: missing-permissions-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'permissions-policy')"
+
+      - type: dsl
+        name: permissions-policy-wildcard
+        dsl:
+          - "contains(tolower(all_headers), 'permissions-policy') && contains(tolower(all_headers), '=*')"
+
+      - type: dsl
+        name: missing-cross-origin-opener-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'cross-origin-opener-policy')"
+
+      - type: dsl
+        name: missing-cross-origin-resource-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'cross-origin-resource-policy')"
+
+      - type: dsl
+        name: missing-cross-origin-embedder-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'cross-origin-embedder-policy')"
+
+      - type: dsl
+        name: missing-x-permitted-cross-domain-policies
+        dsl:
+          - "!contains(tolower(all_headers), 'x-permitted-cross-domain-policies')"
+
+      - type: dsl
+        name: missing-cache-control
+        dsl:
+          - "!contains(tolower(all_headers), 'cache-control')"
+
+      - type: dsl
+        name: permissive-cors-wildcard-origin
+        dsl:
+          - "contains(tolower(all_headers), 'access-control-allow-origin: *')"
+
+      - type: dsl
+        name: invalid-cors-credentials-with-wildcard
+        dsl:
+          - "contains(tolower(all_headers), 'access-control-allow-origin: *') && contains(tolower(all_headers), 'access-control-allow-credentials: true')"
+
+      - type: dsl
+        name: server-header-disclosure
+        dsl:
+          - "contains(tolower(all_headers), 'server:')"
+
+      - type: dsl
+        name: x-powered-by-disclosure
+        dsl:
+          - "contains(tolower(all_headers), 'x-powered-by:')"
+
+      - type: dsl
+        name: x-aspnet-version-disclosure
+        dsl:
+          - "contains(tolower(all_headers), 'x-aspnet-version:') || contains(tolower(all_headers), 'x-aspnetmvc-version:')"
+
+      - type: dsl
+        name: via-header-disclosure
+        dsl:
+          - "contains(tolower(all_headers), 'via:')"
+
+      - type: dsl
+        name: cookie-without-secure-attribute
+        dsl:
+          - "contains(tolower(all_headers), 'set-cookie:') && !contains(tolower(all_headers), '; secure')"
+
+      - type: dsl
+        name: cookie-without-httponly-attribute
+        dsl:
+          - "contains(tolower(all_headers), 'set-cookie:') && !contains(tolower(all_headers), '; httponly')"
+
+      - type: dsl
+        name: cookie-without-samesite-attribute
+        dsl:
+          - "contains(tolower(all_headers), 'set-cookie:') && !contains(tolower(all_headers), 'samesite=')"
+
+      - type: dsl
+        name: html-generator-meta-disclosure
+        dsl:
+          - "contains(tolower(body), '<meta') && contains(tolower(body), 'generator')"
+
+      - type: dsl
+        name: directory-listing-index-page
+        dsl:
+          - "status_code == 200 && contains(tolower(body), 'index of /')"
+
+      - type: dsl
+        name: default-nginx-page
+        dsl:
+          - "contains(tolower(body), 'welcome to nginx')"
+
+      - type: dsl
+        name: default-apache-page
+        dsl:
+          - "contains(tolower(body), 'apache2 ubuntu default page') || contains(tolower(body), 'it works!')"
+
+      - type: dsl
+        name: default-iis-page
+        dsl:
+          - "contains(tolower(body), 'iis windows server') || contains(tolower(body), 'internet information services')"
