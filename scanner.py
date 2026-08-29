@@ -2436,6 +2436,121 @@ def _finding_summary(finding: dict) -> dict:
 def _blank_company() -> dict:
     return {"name": "", "entity": "", "nace": "", "sector": "", "kbo_url": ""}
 
+_SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3,
+              "info": 4, "unknown": 5}
+
+def _slug(text: str, fallback: str = "company") -> str:
+    s = re.sub(r"[^\w\- ]", "", str(text or "")).strip().replace(" ", "_")
+    s = re.sub(r"_+", "_", s)
+    return s[:80] or fallback
+
+def write_company_findings_reports(nuclei_output: str,
+    output_dir: str,
+    lookup: dict,
+    hostname_index: dict) -> List[str]:
+    """Write one plain-text findings report per company.
+
+    Each report lists that company's findings grouped by host and ordered by
+    severity, with the risk and remediation the tool already resolves per
+    finding. Internal analyst output — not addressed to any individual.
+    Returns the list of file paths written.
+    """
+    results_path = Path(nuclei_output)
+    if not results_path.exists() or results_path.stat().st_size == 0:
+        return []
+
+    # company_key -> {"company": {...}, "hosts": {host: [finding_summary, ...]}}
+    companies: Dict[str, dict] = {}
+    for finding in stream_findings(results_path):
+        host = _finding_host(finding)
+        if not host:
+            continue
+        co = _company_record(host, lookup, hostname_index)
+        key = co.get("entity") or co.get("name") or host
+        bucket = companies.setdefault(key, {"company": co, "hosts": {}})
+        summ = _finding_summary(finding)
+        bucket["hosts"].setdefault(host, []).append(summ)
+
+    if not companies:
+        return []
+
+    report_dir = Path(output_dir) / "findings_reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    written: List[str] = []
+
+    for key, data in companies.items():
+        co = data["company"]
+        name = co.get("name") or key
+        sev_counts: Counter = Counter()
+        for findings in data["hosts"].values():
+            for f in findings:
+                sev_counts[f.get("severity", "unknown")] += 1
+        total = sum(sev_counts.values())
+
+        lines: List[str] = []
+        lines.append("=" * 70)
+        lines.append(f"SECURITY FINDINGS REPORT — {name}")
+        lines.append("=" * 70)
+        lines.append(f"Generated : {generated}")
+        if co.get("entity"):
+            lines.append(f"Entity    : {co['entity']}")
+        if co.get("sector"):
+            lines.append(f"NIS2 sector: {co['sector']}"
+                         + (f"  (NACE {co['nace']})" if co.get("nace") else ""))
+        if co.get("kbo_url"):
+            lines.append(f"KBO       : {co['kbo_url']}")
+        lines.append(f"Hosts scanned : {len(data['hosts'])}")
+        sev_line = ", ".join(
+            f"{sev_counts[s]} {s}" for s in
+            ("critical", "high", "medium", "low", "info", "unknown")
+            if sev_counts.get(s))
+        lines.append(f"Findings  : {total}" + (f"  ({sev_line})" if sev_line else ""))
+        lines.append("")
+        lines.append("This is an internal technical findings report for analyst "
+                     "review. It is\nnot correspondence and is not addressed to "
+                     "any individual.")
+        lines.append("")
+
+        for host in sorted(data["hosts"]):
+            findings = sorted(
+                data["hosts"][host],
+                key=lambda f: (_SEV_ORDER.get(f.get("severity", "unknown"), 5),
+                               f.get("name", "")))
+            lines.append("-" * 70)
+            lines.append(f"HOST: {host}")
+            lines.append("-" * 70)
+            if not findings:
+                lines.append("  No findings.")
+                lines.append("")
+                continue
+            for i, f in enumerate(findings, 1):
+                title = f.get("name") or f.get("check") or f.get("template") or "Finding"
+                lines.append(f"[{i}] {title}   ({f.get('severity', 'unknown').upper()})")
+                if f.get("matched_at"):
+                    lines.append(f"    Location    : {f['matched_at']}")
+                if f.get("evidence"):
+                    lines.append(f"    Evidence    : {f['evidence']}")
+                if f.get("risk"):
+                    lines.append(f"    Risk        : {f['risk']}")
+                if f.get("remediation"):
+                    lines.append(f"    Remediation : {f['remediation']}")
+                lines.append("")
+
+        fname = f"findings_{_slug(name)}.txt"
+        fpath = report_dir / fname
+        # Avoid collisions when two companies slugify to the same name.
+        n = 2
+        while fpath.exists():
+            fpath = report_dir / f"findings_{_slug(name)}_{n}.txt"
+            n += 1
+        fpath.write_text("\n".join(lines), encoding="utf-8")
+        written.append(str(fpath))
+
+    if written:
+        ok(f"Wrote {len(written)} per-company findings report(s) → {report_dir}")
+    return written
+
 def _company_record(host: str, lookup: dict, hostname_index: dict) -> dict:
     co = resolve_company(host, lookup, hostname_index) or {}
     out = _blank_company()
@@ -6448,6 +6563,11 @@ def main():
                 args.apollo_key,
                 args.serp_delay, args.no_smtp,
                 args.contact_workers, ci_proxies)
+        step_start("Per-company findings reports")
+        _lookup, _hidx = load_url_lookup(args.output_dir)
+        findings_reports = write_company_findings_reports(
+            nuclei_output, args.output_dir, _lookup, _hidx)
+        step_end()
         maybe_deliver_report(
             output_dir=args.output_dir,
             nuclei_output=nuclei_output,
@@ -6456,6 +6576,7 @@ def main():
             outlook_subject=args.outlook_subject,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
+            extra_attachment_paths=findings_reports,
             timeout=args.power_automate_timeout,
         )
         maybe_upload_to_sharepoint(
@@ -6465,6 +6586,7 @@ def main():
             target_folder=args.sharepoint_folder,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
+            extra_paths=findings_reports,
         )
         header("RUN COMPLETE")
         print_timings()
@@ -6495,6 +6617,12 @@ def main():
                        template_checks=template_checks,
                        scanned_hosts=final_urls,
                        export_xlsx=args.export_xlsx)
+    step_end()
+
+    step_start("Per-company findings reports")
+    _lookup, _hidx = load_url_lookup(args.output_dir)
+    findings_reports = write_company_findings_reports(
+        nuclei_output, args.output_dir, _lookup, _hidx)
     step_end()
 
     # ── Contact enrichment (post-scan) ─────────────────────────────────
@@ -6528,6 +6656,7 @@ def main():
             outlook_subject=args.outlook_subject,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
+            extra_attachment_paths=findings_reports,
             timeout=args.power_automate_timeout,
         )
         maybe_upload_to_sharepoint(
@@ -6537,6 +6666,7 @@ def main():
             target_folder=args.sharepoint_folder,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
+            extra_paths=findings_reports,
         )
 
     header("RUN COMPLETE")
