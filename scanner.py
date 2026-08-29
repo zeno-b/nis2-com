@@ -2474,8 +2474,8 @@ def write_company_findings_reports(nuclei_output: str,
     if not companies:
         return []
 
-    report_dir = Path(output_dir) / "findings_reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
+    report_root = Path(output_dir) / "by_company"
+    report_root.mkdir(parents=True, exist_ok=True)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     written: List[str] = []
 
@@ -2537,18 +2537,20 @@ def write_company_findings_reports(nuclei_output: str,
                     lines.append(f"    Remediation : {f['remediation']}")
                 lines.append("")
 
-        fname = f"findings_{_slug(name)}.txt"
-        fpath = report_dir / fname
+        slug = _slug(name)
+        company_dir = report_root / slug
+        company_dir.mkdir(parents=True, exist_ok=True)
+        fpath = company_dir / f"findings_{slug}.txt"
         # Avoid collisions when two companies slugify to the same name.
         n = 2
         while fpath.exists():
-            fpath = report_dir / f"findings_{_slug(name)}_{n}.txt"
+            fpath = company_dir / f"findings_{slug}_{n}.txt"
             n += 1
         fpath.write_text("\n".join(lines), encoding="utf-8")
         written.append(str(fpath))
 
     if written:
-        ok(f"Wrote {len(written)} per-company findings report(s) → {report_dir}")
+        ok(f"Wrote {len(written)} per-company findings report(s) → {report_root}")
     return written
 
 def _company_record(host: str, lookup: dict, hostname_index: dict) -> dict:
@@ -2557,6 +2559,93 @@ def _company_record(host: str, lookup: dict, hostname_index: dict) -> dict:
     for key in out:
         out[key] = co.get(key, "")
     return out
+
+def _sender_config() -> dict:
+    """Sender identity for outbound intro emails, read from the environment."""
+    return {
+        "name":    os.environ.get("SENDER_NAME", "").strip()    or "[uw naam]",
+        "company": os.environ.get("SENDER_COMPANY", "").strip() or "[uw bedrijf]",
+        "email":   os.environ.get("SENDER_EMAIL", "").strip()   or "[uw e-mailadres]",
+        "phone":   os.environ.get("SENDER_PHONE", "").strip()   or "[uw telefoon]",
+        "unsub":   os.environ.get("UNSUB_URL", "").strip()      or "[afmeldlink]",
+    }
+
+def _intro_email_text(company_name: str, to_addr: str, sender: dict) -> str:
+    """A neutral Dutch B2B service-introduction email.
+
+    Contains no scan findings, no statement that the recipient's systems were
+    examined, and no penalty/liability pressure. It introduces the sender's
+    NIS2 services and asks whether a conversation is relevant, with an opt-out.
+    """
+    naam = company_name or "uw organisatie"
+    lines = [
+        f"Aan: {to_addr or '[algemeen e-mailadres]'}",
+        f"Onderwerp: NIS2-ondersteuning voor {naam}",
+        "",
+        "Beste,",
+        "",
+        "NIS2 is van kracht en raakt steeds meer Belgische organisaties, "
+        "mogelijk ook uw sector. Wij helpen bedrijven om hun beveiliging en "
+        "documentatie in lijn te brengen met de nieuwe verplichtingen, zodat "
+        "u goed voorbereid bent op een eventuele audit.",
+        "",
+        "Wij bieden onder meer:",
+        "- een security-assessment met heldere prioriteiten en aanbevelingen;",
+        "- concrete remediatie-adviezen, afgestemd op NIS2;",
+        "- ondersteuning bij de documentatie die auditoren opvragen.",
+        "",
+        f"Als dit relevant is voor {naam}, plan ik graag een vrijblijvend "
+        "gesprek van twintig minuten om te bekijken waar wij kunnen helpen.",
+        "",
+        "Met vriendelijke groet,",
+        sender["name"],
+        f"{sender['company']} · {sender['phone']} · {sender['email']}",
+        "",
+        "―",
+        "Wilt u geen e-mails meer van ons ontvangen? Antwoord met \"stop\" "
+        f"of gebruik deze afmeldlink: {sender['unsub']}",
+    ]
+    return "\n".join(lines)
+
+def write_intro_emails(scanned_hosts: List[str],
+    output_dir: str,
+    lookup: dict,
+    hostname_index: dict,
+    sender: Optional[dict] = None) -> List[str]:
+    """Write one Dutch B2B intro email per scanned company (general mailbox)."""
+    sender = sender or _sender_config()
+    companies: Dict[str, dict] = {}
+    for host in (scanned_hosts or []):
+        co = _company_record(host, lookup, hostname_index)
+        key = co.get("entity") or co.get("name") or host
+        companies.setdefault(key, {"co": co, "host": host})
+    if not companies:
+        return []
+
+    report_root = Path(output_dir) / "by_company"
+    report_root.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    for key, data in companies.items():
+        co = data["co"]
+        host = data["host"]
+        name = co.get("name") or "uw organisatie"
+        netloc = urlparse(host if "://" in host else "http://" + host).netloc or host
+        domain = netloc.replace("www.", "").strip("/")
+        to_addr = f"info@{domain}" if domain else ""
+        body = _intro_email_text(name, to_addr, sender)
+        slug = _slug(name)
+        company_dir = report_root / slug
+        company_dir.mkdir(parents=True, exist_ok=True)
+        fpath = company_dir / f"intro_{slug}.txt"
+        n = 2
+        while fpath.exists():
+            fpath = company_dir / f"intro_{slug}_{n}.txt"
+            n += 1
+        fpath.write_text(body, encoding="utf-8")
+        written.append(str(fpath))
+    if written:
+        ok(f"Wrote {len(written)} intro email(s) → {report_root}")
+    return written
 
 def _build_readable_scan_report(matrix: dict,
     all_checks: List[dict],
@@ -5535,8 +5624,17 @@ def maybe_upload_to_sharepoint(output_dir: str,
         uploaded_bytes = 0
         first_web_url = ""
         failures: List[str] = []
+        out_root = Path(output_dir or ".").resolve()
         for f in files:
-            remote_path = f"{remote_dir}/{f.name}"
+            # Preserve any per-company subfolder structure under output_dir so
+            # each company's files stay grouped and same-named files (e.g.
+            # findings_*.txt) never collide in one flat folder.
+            try:
+                rel = Path(f).resolve().relative_to(out_root)
+                suffix = str(rel).replace("\\", "/")
+            except (ValueError, OSError):
+                suffix = f.name
+            remote_path = f"{remote_dir}/{suffix}"
             try:
                 web_url = client.upload_file(f, remote_path)
                 uploaded += 1
@@ -6098,6 +6196,10 @@ def parse_args():
                     help="Target library folder (default: SP_TARGET_FOLDER env "
                          "var, else 'NIS2-Scans'). A UTC-timestamped subfolder "
                          "is created per run.")
+    sp.add_argument("--intro-emails", action="store_true",
+                    help="Write a neutral Dutch B2B service-introduction email "
+                         "per company (no findings, no scan reference, with "
+                         "opt-out). Sender from SENDER_* / UNSUB_URL env vars.")
 
     return p.parse_args()
 
@@ -6568,6 +6670,12 @@ def main():
         findings_reports = write_company_findings_reports(
             nuclei_output, args.output_dir, _lookup, _hidx)
         step_end()
+        delivered_extra = list(findings_reports)
+        if args.intro_emails:
+            step_start("Intro emails")
+            delivered_extra += write_intro_emails(
+                final_urls, args.output_dir, _lookup, _hidx)
+            step_end()
         maybe_deliver_report(
             output_dir=args.output_dir,
             nuclei_output=nuclei_output,
@@ -6576,7 +6684,7 @@ def main():
             outlook_subject=args.outlook_subject,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
-            extra_attachment_paths=findings_reports,
+            extra_attachment_paths=delivered_extra,
             timeout=args.power_automate_timeout,
         )
         maybe_upload_to_sharepoint(
@@ -6586,7 +6694,7 @@ def main():
             target_folder=args.sharepoint_folder,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
-            extra_paths=findings_reports,
+            extra_paths=delivered_extra,
         )
         header("RUN COMPLETE")
         print_timings()
@@ -6625,6 +6733,13 @@ def main():
         nuclei_output, args.output_dir, _lookup, _hidx)
     step_end()
 
+    delivered_extra = list(findings_reports)
+    if args.intro_emails:
+        step_start("Intro emails")
+        delivered_extra += write_intro_emails(
+            final_urls, args.output_dir, _lookup, _hidx)
+        step_end()
+
     # ── Contact enrichment (post-scan) ─────────────────────────────────
     _results_exist = (Path(nuclei_output).exists()
                       and Path(nuclei_output).stat().st_size > 0)
@@ -6656,7 +6771,7 @@ def main():
             outlook_subject=args.outlook_subject,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
-            extra_attachment_paths=findings_reports,
+            extra_attachment_paths=delivered_extra,
             timeout=args.power_automate_timeout,
         )
         maybe_upload_to_sharepoint(
@@ -6666,7 +6781,7 @@ def main():
             target_folder=args.sharepoint_folder,
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
-            extra_paths=findings_reports,
+            extra_paths=delivered_extra,
         )
 
     header("RUN COMPLETE")
