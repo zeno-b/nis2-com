@@ -67,7 +67,7 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -202,14 +202,21 @@ except ImportError:
 
 try:
     from colorama import Fore, Style, init as _cinit
-    import platform as _plat
-    _cinit(autoreset=True, strip=_plat.system() == "Windows")
+    # strip=None / convert=None lets colorama auto-detect: it passes ANSI
+    # through on capable terminals (Windows Terminal, VS Code, macOS, Linux)
+    # and converts on legacy Windows consoles. Forcing strip=True on Windows
+    # removed colour even where the terminal supported it.
+    _cinit(autoreset=True)
     HAS_COLOR = True
 except ImportError:
     HAS_COLOR = False
-    class _Stub:
-        def __getattr__(self, _): return ""
-        Fore = _Stub(); Style = _Stub()
+
+    class _StubColor:
+        def __getattr__(self, _):
+            return ""
+
+    Fore = _StubColor()
+    Style = _StubColor()
 
 try:
     import yaml;       HAS_YAML = True
@@ -468,16 +475,22 @@ ANNEX_I_SECTORS = list(NIS2_NACE_PREFIXES.keys())[:10]
 
 _STEP_TIMINGS: List[Dict] = []
 _step_start_ts: float = 0.0
+_step_counter: int = 0
 
 def step_start(name: str) -> None:
-    global _step_start_ts
+    global _step_start_ts, _step_counter
     _step_start_ts = time.monotonic()
+    _step_counter += 1
     _STEP_TIMINGS.append({"step": name, "elapsed": None})
+    if not QUIET:
+        print(_c(f"\n[{_step_counter}] {name}", Fore.CYAN + Style.BRIGHT))
 
 def step_end() -> None:
     elapsed = time.monotonic() - _step_start_ts
     if _STEP_TIMINGS:
         _STEP_TIMINGS[-1]["elapsed"] = round(elapsed, 2)
+    if not QUIET:
+        print(_c(f"    done in {elapsed:.1f}s", Style.DIM))
 
 def save_timings(output_dir: str) -> None:
     path = Path(output_dir) / TIMINGS_FILE
@@ -520,8 +533,14 @@ def warn(m: str)    -> None: print(_c(f"[!] {m}", Fore.YELLOW))
 def error(m: str)   -> None: print(_c(f"[✗] {m}", Fore.RED))
 
 def header(m: str) -> None:
-    if not QUIET:
-        print(_c(f"\n{'━'*68}\n    {m}\n{'━'*68}", Fore.MAGENTA))
+    if QUIET:
+        return
+    # A "STEP N – ..." banner now duplicates the bright step line printed by
+    # step_start(), so render it as a quiet rule instead of a full banner.
+    if m.startswith("STEP "):
+        print(_c(f"  {'─'*66}", Style.DIM))
+        return
+    print(_c(f"\n{'━'*68}\n    {m}\n{'━'*68}", Fore.MAGENTA + Style.BRIGHT))
 
 def bullet(m: str) -> None:
     if not QUIET: print(_c(f"    {m}", Fore.WHITE))
@@ -5147,7 +5166,12 @@ class _SharePointClient:
         self.tenant_id = tenant_id
         self.client_id = client_id
         self.client_secret = client_secret
-        self.hostname = hostname
+        # Tolerate a pasted scheme/trailing slash: Graph needs the bare host
+        # (e.g. contoso.sharepoint.com), not https://contoso.sharepoint.com/.
+        host = str(hostname).strip()
+        host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+        host = host.split("/", 1)[0].rstrip("/").strip()
+        self.hostname = host
         self.site_path = site_path if site_path.startswith("/") else "/" + site_path
         self._token = None
         self._token_expiry = 0.0
@@ -5334,28 +5358,62 @@ def maybe_upload_to_sharepoint(output_dir: str,
         return False
 
     header("SHAREPOINT UPLOAD")
-    stamp = datetime.utcnow().strftime("%Y-%m-%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     remote_dir = f"{folder.strip('/')}/{stamp}"
 
     try:
         client = _SharePointClient(tenant_id, client_id, client_secret,
                                    hostname, site_path)
-        bullet(f"Site      : {hostname}{client.site_path}")
-        bullet(f"Folder    : {remote_dir}")
+        bullet(f"Site   : {client.hostname}{client.site_path}")
+        bullet(f"Folder : {remote_dir}")
+        info(f"Uploading {len(files)} artifact(s)…")
+
         uploaded = 0
+        uploaded_bytes = 0
+        first_web_url = ""
+        failures: List[str] = []
         for f in files:
             remote_path = f"{remote_dir}/{f.name}"
             try:
                 web_url = client.upload_file(f, remote_path)
                 uploaded += 1
-                ok(f"  ↑ {f.name}"
-                   + (f"  → {web_url}" if web_url else ""))
+                uploaded_bytes += f.stat().st_size
+                first_web_url = first_web_url or web_url
+                ok(f"  {f.name}")
+            except PermissionError as e:
+                # A 403/401 on the first file is systemic (auth/grant), not a
+                # per-file problem — report it once and stop rather than
+                # repeating the same error for every remaining artifact.
+                error("Upload not authorised — stopping.")
+                bullet(str(e))
+                return False
             except Exception as e:  # noqa: BLE001 — one bad file must not abort the rest
-                warn(f"  ✗ {f.name}: {e}")
-        ok(f"Uploaded {uploaded}/{len(files)} artifact(s) to SharePoint.")
-        return uploaded > 0
+                failures.append(f"{f.name}: {e}")
+
+        # Verdict
+        if uploaded == 0:
+            error(f"Upload failed — 0/{len(files)} artifact(s) sent.")
+            for msg in failures[:3]:
+                bullet(msg)
+            if len(failures) > 3:
+                bullet(f"…and {len(failures) - 3} more.")
+            return False
+
+        size_mb = uploaded_bytes / (1024 * 1024)
+        ok(f"Uploaded {uploaded}/{len(files)} artifact(s) "
+           f"({size_mb:.1f} MB) to SharePoint.")
+        if failures:
+            warn(f"{len(failures)} artifact(s) failed:")
+            for msg in failures[:3]:
+                bullet(msg)
+            if len(failures) > 3:
+                bullet(f"…and {len(failures) - 3} more.")
+        if first_web_url:
+            bullet(f"View: {first_web_url.rsplit('/', 1)[0]}")
+        return True
     except PermissionError as e:
-        error(f"SharePoint upload failed: {e}")
+        error("Upload not authorised.")
+        bullet(str(e))
         return False
     except Exception as e:  # noqa: BLE001
         error(f"SharePoint upload failed: {e}")
