@@ -555,6 +555,11 @@ def error(m: str)   -> None: print(_c(f"[✗] {m}", Fore.RED))
 def header(m: str) -> None:
     if QUIET:
         return
+    # "[CI] ..." markers fire once per company across 9 sub-steps, so a full
+    # banner each time floods the log. Render them as a single indented line.
+    if m.startswith("[CI]"):
+        print(_c(f"  › {m[4:].strip()}", Fore.CYAN))
+        return
     # A "STEP N – ..." banner now duplicates the bright step line printed by
     # step_start(), so render it as a quiet rule instead of a full banner.
     if m.startswith("STEP "):
@@ -564,6 +569,9 @@ def header(m: str) -> None:
 
 def bullet(m: str) -> None:
     if not QUIET: print(_c(f"    {m}", Fore.WHITE))
+
+def detail(m: str) -> None:
+    if not QUIET: print(_c(f"      {m}", Style.DIM))
 
 def _emit_progress(text: str) -> None:
     """Redraw a single-line \\r progress counter that fits the terminal width.
@@ -4310,15 +4318,19 @@ def ci_run_single(kbo: str, domain: str,
         _upsert(e["name"], "", "Staatsblad")
 
     # 4-7 SERP + LinkedIn per contact
-    header(f"[CI] Steps 4-7/9  SERP + LinkedIn  ({len(pool)} contacts)")
+    header(f"[CI] Step 4-7/9  SERP search + LinkedIn lookup  ({len(pool)} contact(s))")
     mx_host = _ci_mx_for(domain) if _CI_DNS else None
 
     # Fetch LinkedIn company page once for the org (not per-contact)
     li_company_about = ci_fetch_linkedin_company(domain, proxies, delay)
     if li_company_about:
-        info(f"[CI-LI] Company page: {li_company_about[:80]}")
+        detail(f"company LinkedIn: {li_company_about[:70]}")
+
+    if not pool:
+        detail("no contacts to enrich for this company")
 
     for k, c in pool.items():
+        detail(f"{c.name} — searching…")
         # Always generate a search URL — analyst can use it even if automation fails
         c.linkedin_search_url = _ci_linkedin_search_url(c.name, org.name)
 
@@ -4351,8 +4363,6 @@ def ci_run_single(kbo: str, domain: str,
             if li.get("company"):
                 c.notes = (c.notes + f" | LI: {li['role']} @ {li['company']}"
                            ).strip(" |")
-        else:
-            info(f"[CI-LI] No profile found for {c.name} — search URL generated")
 
         if not c.email:
             parts = c.name.split()
@@ -4360,6 +4370,24 @@ def ci_run_single(kbo: str, domain: str,
                 c.email        = _ci_infer_email(parts[0], parts[-1],
                                                  domain, org.email_pattern)
                 c.email_status = "inferred"
+
+        # Per-contact result: what each source produced
+        serp_hits = []
+        if serp.get("linkedin_url"):
+            serp_hits.append("linkedin")
+        if serp.get("emails"):
+            serp_hits.append("email")
+        if serp.get("phones"):
+            serp_hits.append("phone")
+        serp_summary = "+".join(serp_hits) if serp_hits else "no hits"
+        if c.linkedin_url:
+            li_role = getattr(c, "linkedin_role", "")
+            li_summary = f"profile ({li_role})" if li_role else "profile"
+        else:
+            li_summary = "search-url only"
+        email_summary = c.email_status or ("none" if not c.email else "found")
+        detail(f"{c.name:<26}  SERP:{serp_summary}  LinkedIn:{li_summary}  "
+               f"email:{email_summary}")
 
     # 8 External email/contact databases
     header("[CI] Step 8/9  External databases  "
