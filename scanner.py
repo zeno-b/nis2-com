@@ -774,6 +774,8 @@ def apply_config_to_args(cfg: dict, args) -> None:
     "outlook_subject":"outlook_subject",
     "power_automate_timeout":"power_automate_timeout",
     "attach_report_files":"attach_report_files",
+    "sharepoint_upload":"sharepoint_upload",
+    "sharepoint_folder":"sharepoint_folder",
     "annex1_only":"annex1_only",
     "enrich_contacts":"enrich_contacts",
     "contact_only":"contact_only",
@@ -5098,6 +5100,250 @@ def send_report_via_power_automate(webhook_url: str,
         warn(f"Power Automate delivery failed: {e}")
         return False
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SharePoint upload (Microsoft Graph, client-credentials flow)
+#
+# Credentials are read from the environment, never from CLI flags:
+#   SP_TENANT_ID        Entra directory (tenant) ID
+#   SP_CLIENT_ID        app registration (client) ID
+#   SP_CLIENT_SECRET    client secret value
+#   SP_HOSTNAME         e.g. contoso.sharepoint.com
+#   SP_SITE_PATH        e.g. /sites/NIS2
+#   SP_TARGET_FOLDER    optional, default "NIS2-Scans"
+#
+# The app needs the Graph application permission Sites.Selected, plus a
+# per-site "write" grant on the target site. Sites.Selected grants nothing
+# until that per-site authorisation is added, so it is the least-privilege
+# option here — do not substitute Sites.ReadWrite.All.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
+_SP_SIMPLE_PUT_LIMIT = 4 * 1024 * 1024          # 4 MiB
+_SP_CHUNK = 8 * 320 * 1024                       # 2.5 MiB, multiple of 320 KiB
+
+
+class _SharePointClient:
+    """Minimal Graph client using only the standard library."""
+
+    def __init__(self, tenant_id, client_id, client_secret, hostname, site_path):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.hostname = hostname
+        self.site_path = site_path if site_path.startswith("/") else "/" + site_path
+        self._token = None
+        self._token_expiry = 0.0
+        self._site_id = None
+        self._drive_id = None
+
+    # -- auth ----------------------------------------------------------------
+    def _access_token(self):
+        if self._token and time.time() < self._token_expiry - 60:
+            return self._token
+        body = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        }).encode()
+        url = (f"https://login.microsoftonline.com/{self.tenant_id}"
+               "/oauth2/v2.0/token")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            raise RuntimeError(f"token request failed ({e.code}): {detail}") from None
+        self._token = data["access_token"]
+        self._token_expiry = time.time() + int(data.get("expires_in", 3600))
+        return self._token
+
+    # -- low-level request ---------------------------------------------------
+    def _graph(self, method, url, *, body=None, content_type=None, raw=False,
+               use_bearer=True):
+        req = urllib.request.Request(url, data=body, method=method)
+        if use_bearer:
+            req.add_header("Authorization", f"Bearer {self._access_token()}")
+        if content_type:
+            req.add_header("Content-Type", content_type)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                payload = r.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            if e.code == 403:
+                raise PermissionError(
+                    "Graph returned 403. The token is valid but the app is not "
+                    "authorised on this site — add a Sites.Selected 'write' grant "
+                    "for the app on the target site."
+                ) from None
+            raise RuntimeError(f"{method} {url} failed ({e.code}): {detail}") from None
+        if raw:
+            return payload
+        return json.loads(payload) if payload else {}
+
+    # -- resource resolution -------------------------------------------------
+    @property
+    def site_id(self):
+        if self._site_id is None:
+            url = f"{_GRAPH_ROOT}/sites/{self.hostname}:{self.site_path}"
+            self._site_id = self._graph("GET", url)["id"]
+        return self._site_id
+
+    @property
+    def drive_id(self):
+        if self._drive_id is None:
+            url = f"{_GRAPH_ROOT}/sites/{self.site_id}/drive"
+            self._drive_id = self._graph("GET", url)["id"]
+        return self._drive_id
+
+    # -- upload --------------------------------------------------------------
+    def upload_file(self, local_path, remote_path):
+        local_path = Path(local_path)
+        size = local_path.stat().st_size
+        enc_remote = urllib.parse.quote(remote_path)
+        if size <= _SP_SIMPLE_PUT_LIMIT:
+            url = f"{_GRAPH_ROOT}/drives/{self.drive_id}/root:/{enc_remote}:/content"
+            with open(local_path, "rb") as fh:
+                item = self._graph("PUT", url, body=fh.read(),
+                                   content_type="application/octet-stream")
+            return item.get("webUrl", "")
+        return self._upload_large(local_path, enc_remote, size)
+
+    def _upload_large(self, local_path, enc_remote, size):
+        session_url = (f"{_GRAPH_ROOT}/drives/{self.drive_id}/root:/"
+                       f"{enc_remote}:/createUploadSession")
+        session = self._graph(
+            "POST", session_url,
+            body=json.dumps({"item": {"@microsoft.graph.conflictBehavior": "replace"}}).encode(),
+            content_type="application/json",
+        )
+        upload_url = session["uploadUrl"]
+        web_url = ""
+        with open(local_path, "rb") as fh:
+            offset = 0
+            while offset < size:
+                chunk = fh.read(_SP_CHUNK)
+                end = offset + len(chunk) - 1
+                # The upload session URL is pre-authorised; no bearer token here.
+                req = urllib.request.Request(upload_url, data=chunk, method="PUT")
+                req.add_header("Content-Length", str(len(chunk)))
+                req.add_header("Content-Range", f"bytes {offset}-{end}/{size}")
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    if r.status in (200, 201):
+                        web_url = json.loads(r.read()).get("webUrl", "")
+                offset = end + 1
+        return web_url
+
+
+def maybe_upload_to_sharepoint(output_dir: str,
+    nuclei_output: str,
+    enabled: bool,
+    target_folder: str = "",
+    scanned_hosts: Optional[List[str]] = None,
+    preferred_report_path: str = "",
+    include_report_files: bool = False,
+    extra_paths: Optional[List[str]] = None) -> bool:
+    """
+    Upload scan artifacts to a SharePoint document library via Graph.
+    No-op unless `enabled` is set and the SP_* environment variables are present.
+    Files land under <target_folder>/<UTC timestamp>/ so runs never overwrite.
+    """
+    if not enabled:
+        return False
+
+    tenant_id = os.environ.get("SP_TENANT_ID", "").strip()
+    client_id = os.environ.get("SP_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SP_CLIENT_SECRET", "").strip()
+    hostname = os.environ.get("SP_HOSTNAME", "").strip()
+    site_path = os.environ.get("SP_SITE_PATH", "").strip()
+
+    missing = [name for name, val in (
+        ("SP_TENANT_ID", tenant_id), ("SP_CLIENT_ID", client_id),
+        ("SP_CLIENT_SECRET", client_secret), ("SP_HOSTNAME", hostname),
+        ("SP_SITE_PATH", site_path),
+    ) if not val]
+    if missing:
+        warn(f"SharePoint upload requested but missing env var(s): "
+             f"{', '.join(missing)} — skipping upload.")
+        return False
+
+    folder = (target_folder
+              or os.environ.get("SP_TARGET_FOLDER", "").strip()
+              or "NIS2-Scans")
+
+    # Collect the same artifact set the Power Automate delivery uses.
+    out_dir = Path(output_dir or ".")
+    candidates: List[Path] = []
+    if preferred_report_path:
+        candidates.append(Path(preferred_report_path))
+    for name in (SCAN_RESULTS_HTML, "nis2_report.html", "nis2_summary_brief.html"):
+        candidates.append(out_dir / name)
+    candidates.extend(sorted(out_dir.glob("report_*.html")))
+    if include_report_files:
+        for name in (
+            SCAN_RESULTS_JSON, SCAN_RESULTS_CSV, SCAN_RESULTS_HTML,
+            "full_coverage_report.csv", "full_coverage_report.xlsx",
+            "combined_contacts.csv", "combined_contacts.json",
+            "contact_enrichment.csv", "contact_enrichment.json",
+            "nis2_companies_manifest.csv", "step_timings.json",
+        ):
+            candidates.append(out_dir / name)
+    if nuclei_output:
+        candidates.append(Path(nuclei_output))
+    for extra in (extra_paths or []):
+        if extra:
+            candidates.append(Path(extra))
+
+    # De-duplicate, keep only existing non-empty files.
+    seen = set()
+    files: List[Path] = []
+    for c in candidates:
+        try:
+            rp = c.resolve()
+        except OSError:
+            rp = c
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if c.exists() and c.is_file() and c.stat().st_size > 0:
+            files.append(c)
+
+    if not files:
+        warn("SharePoint upload: no artifacts found to upload — skipping.")
+        return False
+
+    header("SHAREPOINT UPLOAD")
+    stamp = datetime.utcnow().strftime("%Y-%m-%dT%H%M%SZ")
+    remote_dir = f"{folder.strip('/')}/{stamp}"
+
+    try:
+        client = _SharePointClient(tenant_id, client_id, client_secret,
+                                   hostname, site_path)
+        bullet(f"Site      : {hostname}{client.site_path}")
+        bullet(f"Folder    : {remote_dir}")
+        uploaded = 0
+        for f in files:
+            remote_path = f"{remote_dir}/{f.name}"
+            try:
+                web_url = client.upload_file(f, remote_path)
+                uploaded += 1
+                ok(f"  ↑ {f.name}"
+                   + (f"  → {web_url}" if web_url else ""))
+            except Exception as e:  # noqa: BLE001 — one bad file must not abort the rest
+                warn(f"  ✗ {f.name}: {e}")
+        ok(f"Uploaded {uploaded}/{len(files)} artifact(s) to SharePoint.")
+        return uploaded > 0
+    except PermissionError as e:
+        error(f"SharePoint upload failed: {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        error(f"SharePoint upload failed: {e}")
+        return False
+
+
 def maybe_deliver_report(output_dir: str,
     nuclei_output: str,
     webhook_url: str,
@@ -5605,6 +5851,16 @@ def parse_args():
     dg.add_argument("--attach-report-files", action="store_true",
                     help="Embed report artifacts as base64 attachments in payload")
 
+    sp = p.add_argument_group("Report delivery (SharePoint / Microsoft Graph)")
+    sp.add_argument("--sharepoint-upload", action="store_true",
+                    help="Upload scan artifacts to SharePoint. Credentials come "
+                         "from SP_TENANT_ID / SP_CLIENT_ID / SP_CLIENT_SECRET / "
+                         "SP_HOSTNAME / SP_SITE_PATH env vars.")
+    sp.add_argument("--sharepoint-folder", default="", metavar="NAME",
+                    help="Target library folder (default: SP_TARGET_FOLDER env "
+                         "var, else 'NIS2-Scans'). A UTC-timestamped subfolder "
+                         "is created per run.")
+
     return p.parse_args()
 
 def resolve_run_mode(args) -> Tuple[str, bool, bool, bool]:
@@ -5694,6 +5950,16 @@ def main():
             include_report_files=args.attach_report_files,
             extra_attachment_paths=[csv_path, json_path],
             timeout=args.power_automate_timeout,
+        )
+        maybe_upload_to_sharepoint(
+            output_dir=out_dir,
+            nuclei_output=nuclei_out,
+            enabled=args.sharepoint_upload,
+            target_folder=args.sharepoint_folder,
+            scanned_hosts=[args.domain],
+            preferred_report_path=report_path,
+            include_report_files=args.attach_report_files,
+            extra_paths=[csv_path, json_path],
         )
         ok(f"Done. {len(org.contacts)} contacts → {out_dir}/contacts_{stem}.*")
         sys.exit(0)
@@ -6069,6 +6335,14 @@ def main():
             include_report_files=args.attach_report_files,
             timeout=args.power_automate_timeout,
         )
+        maybe_upload_to_sharepoint(
+            output_dir=args.output_dir,
+            nuclei_output=nuclei_output,
+            enabled=args.sharepoint_upload,
+            target_folder=args.sharepoint_folder,
+            scanned_hosts=final_urls,
+            include_report_files=args.attach_report_files,
+        )
         header("RUN COMPLETE")
         print_timings()
         save_timings(args.output_dir)
@@ -6132,6 +6406,14 @@ def main():
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
             timeout=args.power_automate_timeout,
+        )
+        maybe_upload_to_sharepoint(
+            output_dir=args.output_dir,
+            nuclei_output=nuclei_output,
+            enabled=args.sharepoint_upload,
+            target_folder=args.sharepoint_folder,
+            scanned_hosts=final_urls,
+            include_report_files=args.attach_report_files,
         )
 
     header("RUN COMPLETE")
