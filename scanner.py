@@ -61,6 +61,7 @@ import re
 # FIX 4: removed unused `import signal`
 
 import socket
+import shutil
 import subprocess
 import sys
 import threading
@@ -525,6 +526,26 @@ def header(m: str) -> None:
 def bullet(m: str) -> None:
     if not QUIET: print(_c(f"    {m}", Fore.WHITE))
 
+def _emit_progress(text: str) -> None:
+    """Redraw a single-line \\r progress counter that fits the terminal width.
+
+    Truncates to the current column count and pads to overwrite any residue
+    from a longer previous line, so a window narrower than the counter no
+    longer wraps and leaves a garbled trail. Pass plain text (no ANSI/colour),
+    since the length has to be measured to be truncated correctly.
+    """
+    if QUIET:
+        return
+    try:
+        cols = shutil.get_terminal_size((80, 20)).columns
+    except Exception:
+        cols = 80
+    limit = max(cols - 1, 20)
+    if len(text) > limit:
+        text = text[:limit]
+    sys.stdout.write("\r" + text.ljust(limit))
+    sys.stdout.flush()
+
 def subhead(m: str) -> None:
     if not QUIET: print(_c(f"\n  ── {m} ──", Fore.CYAN))
 
@@ -857,7 +878,10 @@ def codes_for_filter(sectors: List[str], naces: List[str]) -> set:
             if not re.fullmatch(r"\d{4,5}", str(n).strip()):
                 error(f"Invalid NACE code '{n}' – must be 4 or 5 digits.")
                 sys.exit(1)
-        result.update([str(n).strip() for n in naces])
+        # The reference table and the activity.csv filter both operate at
+        # 4-digit NACE granularity (the filter truncates NaceCode to [:4]),
+        # so a 5-digit code must be narrowed to 4 or it can never match.
+        result.update([str(n).strip()[:4] for n in naces])
 
     if not result:
         for codes in NIS2_NACE_PREFIXES.values():
@@ -926,11 +950,11 @@ def _load_csv(path, required_cols, label, filter_fn=None, chunksize=200_000):
                 chunks.append(chunk)
             elapsed = time.time() - start
             speed   = rows_read / elapsed if elapsed > 0 else 0
-            print(f"\r  {_c('►', Fore.CYAN)} "
-                  f"Read {rows_read:>12,}  |  "
-                  f"Kept {rows_kept:>8,}  |  "
-                  f"{speed:>8,.0f} rows/s  |  {elapsed:>5.1f}s",
-                  end="", flush=True)
+            _emit_progress(
+                f"  ► Read {rows_read:>12,}  |  "
+                f"Kept {rows_kept:>8,}  |  "
+                f"{speed:>8,.0f} rows/s  |  {elapsed:>5.1f}s"
+            )
     except MemoryError:
         print(); error("Out of RAM while loading CSV.")
         bullet("Try --limit or increase available memory."); sys.exit(1)
@@ -1027,14 +1051,11 @@ def load_nis2_entities(
                             reached_eof = False
                             elapsed = time.time() - start
                             speed = rows_read / elapsed if elapsed > 0 else 0
-                            print(
-                                f"\r  {_c('►', Fore.CYAN)} "
-                                f"Read {rows_read:>12,}  |  "
+                            _emit_progress(
+                                f"  ► Read {rows_read:>12,}  |  "
                                 f"Kept {rows_kept:>8,}  |  "
                                 f"Unique {len(unique_entities):>8,}  |  "
-                                f"{speed:>8,.0f} rows/s  |  {elapsed:>5.1f}s",
-                                end="",
-                                flush=True,
+                                f"{speed:>8,.0f} rows/s  |  {elapsed:>5.1f}s"
                             )
                             break
             elapsed = time.time() - start
@@ -1044,13 +1065,10 @@ def load_nis2_entities(
                 if stop_after_entities is not None
                 else ""
             )
-            print(
-                f"\r  {_c('►', Fore.CYAN)} "
-                f"Read {rows_read:>12,}  |  "
+            _emit_progress(
+                f"  ► Read {rows_read:>12,}  |  "
                 f"Kept {rows_kept:>8,}{unique_part}  |  "
-                f"{speed:>8,.0f} rows/s  |  {elapsed:>5.1f}s",
-                end="",
-                flush=True,
+                f"{speed:>8,.0f} rows/s  |  {elapsed:>5.1f}s"
             )
     except ValueError as e:
         msg = str(e)
