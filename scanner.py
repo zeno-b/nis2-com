@@ -2647,6 +2647,153 @@ def write_intro_emails(scanned_hosts: List[str],
         ok(f"Wrote {len(written)} intro email(s) → {report_root}")
     return written
 
+# ── Split aggregate outputs into one file set per company ──────────────
+_SPLIT_NAME_COLS = ["Company", "org_name", "company", "Denomination",
+                    "denomination", "Naam", "name"]
+_SPLIT_HOST_COLS = ["Host", "host", "url", "URL", "domain", "Domain",
+                    "website", "Website"]
+
+def _row_company(row: dict, lookup: dict, hostname_index: dict) -> str:
+    for col in _SPLIT_NAME_COLS:
+        v = str(row.get(col, "") or "").strip()
+        if v:
+            return v
+    for col in _SPLIT_HOST_COLS:
+        v = str(row.get(col, "") or "").strip()
+        if v:
+            co = _company_record(v, lookup, hostname_index)
+            if co.get("name"):
+                return co["name"]
+    return ""
+
+def _split_csv(path: Path, root: Path, lookup, hostname_index) -> List[str]:
+    import pandas as pd
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    if df.empty:
+        return []
+    df["__company"] = df.apply(
+        lambda r: _row_company(r.to_dict(), lookup, hostname_index)
+        or "_unassigned", axis=1)
+    written = []
+    for co, sub in df.groupby("__company"):
+        d = root / _slug(co, "unassigned")
+        d.mkdir(parents=True, exist_ok=True)
+        fp = d / path.name
+        sub.drop(columns="__company").to_csv(fp, index=False)
+        written.append(str(fp))
+    return written
+
+def _split_xlsx(path: Path, root: Path, lookup, hostname_index) -> List[str]:
+    import pandas as pd
+    df = pd.read_excel(path, dtype=str)
+    df = df.fillna("")
+    if df.empty:
+        return []
+    df["__company"] = df.apply(
+        lambda r: _row_company(r.to_dict(), lookup, hostname_index)
+        or "_unassigned", axis=1)
+    written = []
+    for co, sub in df.groupby("__company"):
+        d = root / _slug(co, "unassigned")
+        d.mkdir(parents=True, exist_ok=True)
+        fp = d / path.name
+        sub.drop(columns="__company").to_excel(fp, index=False)
+        written.append(str(fp))
+    return written
+
+def _split_json_list(path: Path, root: Path, lookup, hostname_index) -> List[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list) or not data:
+        return []  # nested report objects are covered by the CSV split
+    groups: Dict[str, list] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        co = _row_company(item, lookup, hostname_index) or "_unassigned"
+        groups.setdefault(_slug(co, "unassigned"), []).append(item)
+    written = []
+    for slug, items in groups.items():
+        d = root / slug
+        d.mkdir(parents=True, exist_ok=True)
+        fp = d / path.name
+        fp.write_text(json.dumps(items, indent=2, ensure_ascii=False),
+                      encoding="utf-8")
+        written.append(str(fp))
+    return written
+
+def _split_nuclei_jsonl(path: Path, root: Path, lookup, hostname_index) -> List[str]:
+    groups: Dict[str, list] = {}
+    for finding in stream_findings(path):
+        host = _finding_host(finding)
+        co = _company_record(host, lookup, hostname_index).get("name") or "_unassigned"
+        groups.setdefault(_slug(co, "unassigned"), []).append(finding)
+    written = []
+    for slug, items in groups.items():
+        d = root / slug
+        d.mkdir(parents=True, exist_ok=True)
+        fp = d / path.name
+        fp.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in items),
+                      encoding="utf-8")
+        written.append(str(fp))
+    return written
+
+def split_outputs_by_company(output_dir: str,
+    nuclei_output: str,
+    lookup: dict,
+    hostname_index: dict) -> List[str]:
+    """Split every aggregate output into one file per company under by_company/.
+
+    After this runs, each company's folder holds its own scan CSV, coverage
+    CSV/XLSX, contacts, manifest row, and findings JSONL, so no delivered file
+    spans more than one company. Rows that can't be attributed land in an
+    _unassigned/ folder rather than being dropped.
+    """
+    out = Path(output_dir)
+    root = out / "by_company"
+    root.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+
+    csv_files = [SCAN_RESULTS_CSV, COVERAGE_CSV, "contact_enrichment.csv",
+                 "combined_contacts.csv", "nis2_companies_manifest.csv"]
+    for name in csv_files:
+        p = out / name
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                written += _split_csv(p, root, lookup, hostname_index)
+            except Exception as e:  # noqa: BLE001
+                warn(f"split {name}: {e}")
+
+    xlsx_p = out / COVERAGE_CSV.replace(".csv", ".xlsx")
+    if xlsx_p.exists() and xlsx_p.stat().st_size > 0:
+        try:
+            written += _split_xlsx(xlsx_p, root, lookup, hostname_index)
+        except Exception as e:  # noqa: BLE001
+            warn(f"split {xlsx_p.name}: {e}")
+
+    for name in ("contact_enrichment.json", "combined_contacts.json"):
+        p = out / name
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                written += _split_json_list(p, root, lookup, hostname_index)
+            except Exception as e:  # noqa: BLE001
+                warn(f"split {name}: {e}")
+
+    if nuclei_output and Path(nuclei_output).exists() \
+            and Path(nuclei_output).stat().st_size > 0:
+        try:
+            written += _split_nuclei_jsonl(Path(nuclei_output), root,
+                                           lookup, hostname_index)
+        except Exception as e:  # noqa: BLE001
+            warn(f"split {Path(nuclei_output).name}: {e}")
+
+    if written:
+        n_co = len({Path(p).parent.name for p in written})
+        ok(f"Split aggregates into {n_co} company folder(s) → {root}")
+    return written
+
 def _build_readable_scan_report(matrix: dict,
     all_checks: List[dict],
     findings: List[dict],
@@ -5539,7 +5686,8 @@ def maybe_upload_to_sharepoint(output_dir: str,
     scanned_hosts: Optional[List[str]] = None,
     preferred_report_path: str = "",
     include_report_files: bool = False,
-    extra_paths: Optional[List[str]] = None) -> bool:
+    extra_paths: Optional[List[str]] = None,
+    only_extra_paths: bool = False) -> bool:
     """
     Upload scan artifacts to a SharePoint document library via Graph.
     No-op unless `enabled` is set and the SP_* environment variables are present.
@@ -5571,25 +5719,33 @@ def maybe_upload_to_sharepoint(output_dir: str,
     # Collect the same artifact set the Power Automate delivery uses.
     out_dir = Path(output_dir or ".")
     candidates: List[Path] = []
-    if preferred_report_path:
-        candidates.append(Path(preferred_report_path))
-    for name in (SCAN_RESULTS_HTML, "nis2_report.html", "nis2_summary_brief.html"):
-        candidates.append(out_dir / name)
-    candidates.extend(sorted(out_dir.glob("report_*.html")))
-    if include_report_files:
-        for name in (
-            SCAN_RESULTS_JSON, SCAN_RESULTS_CSV, SCAN_RESULTS_HTML,
-            "full_coverage_report.csv", "full_coverage_report.xlsx",
-            "combined_contacts.csv", "combined_contacts.json",
-            "contact_enrichment.csv", "contact_enrichment.json",
-            "nis2_companies_manifest.csv", "step_timings.json",
-        ):
+    if only_extra_paths:
+        # Per-company split mode: deliver ONLY the by_company/ tree so no
+        # uploaded file spans multiple companies. Skip the HTML report, the
+        # aggregates, and the raw nuclei JSONL — all of which are multi-company.
+        for extra in (extra_paths or []):
+            if extra:
+                candidates.append(Path(extra))
+    else:
+        if preferred_report_path:
+            candidates.append(Path(preferred_report_path))
+        for name in (SCAN_RESULTS_HTML, "nis2_report.html", "nis2_summary_brief.html"):
             candidates.append(out_dir / name)
-    if nuclei_output:
-        candidates.append(Path(nuclei_output))
-    for extra in (extra_paths or []):
-        if extra:
-            candidates.append(Path(extra))
+        candidates.extend(sorted(out_dir.glob("report_*.html")))
+        if include_report_files:
+            for name in (
+                SCAN_RESULTS_JSON, SCAN_RESULTS_CSV, SCAN_RESULTS_HTML,
+                "full_coverage_report.csv", "full_coverage_report.xlsx",
+                "combined_contacts.csv", "combined_contacts.json",
+                "contact_enrichment.csv", "contact_enrichment.json",
+                "nis2_companies_manifest.csv", "step_timings.json",
+            ):
+                candidates.append(out_dir / name)
+        if nuclei_output:
+            candidates.append(Path(nuclei_output))
+        for extra in (extra_paths or []):
+            if extra:
+                candidates.append(Path(extra))
 
     # De-duplicate, keep only existing non-empty files.
     seen = set()
@@ -6200,6 +6356,12 @@ def parse_args():
                     help="Write a neutral Dutch B2B service-introduction email "
                          "per company (no findings, no scan reference, with "
                          "opt-out). Sender from SENDER_* / UNSUB_URL env vars.")
+    sp.add_argument("--split-by-company", action="store_true",
+                    help="Split every aggregate output (scan CSV/JSON, coverage, "
+                         "contacts, manifest, nuclei findings) into one file set "
+                         "per company under by_company/. When set, delivery and "
+                         "upload send ONLY the per-company tree, so no delivered "
+                         "file spans multiple companies.")
 
     return p.parse_args()
 
@@ -6676,6 +6838,11 @@ def main():
             delivered_extra += write_intro_emails(
                 final_urls, args.output_dir, _lookup, _hidx)
             step_end()
+        if args.split_by_company:
+            step_start("Split outputs by company")
+            delivered_extra += split_outputs_by_company(
+                args.output_dir, nuclei_output, _lookup, _hidx)
+            step_end()
         maybe_deliver_report(
             output_dir=args.output_dir,
             nuclei_output=nuclei_output,
@@ -6695,6 +6862,7 @@ def main():
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
             extra_paths=delivered_extra,
+            only_extra_paths=args.split_by_company,
         )
         header("RUN COMPLETE")
         print_timings()
@@ -6739,6 +6907,11 @@ def main():
         delivered_extra += write_intro_emails(
             final_urls, args.output_dir, _lookup, _hidx)
         step_end()
+    if args.split_by_company:
+        step_start("Split outputs by company")
+        delivered_extra += split_outputs_by_company(
+            args.output_dir, nuclei_output, _lookup, _hidx)
+        step_end()
 
     # ── Contact enrichment (post-scan) ─────────────────────────────────
     _results_exist = (Path(nuclei_output).exists()
@@ -6782,6 +6955,7 @@ def main():
             scanned_hosts=final_urls,
             include_report_files=args.attach_report_files,
             extra_paths=delivered_extra,
+            only_extra_paths=args.split_by_company,
         )
 
     header("RUN COMPLETE")
