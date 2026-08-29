@@ -251,7 +251,7 @@ try:
 except ImportError:    HAS_ORJSON = False
 
 try:
-    import openpyxl;   HAS_OPENPYXL = True
+    import openpyxl; HAS_OPENPYXL = True   # noqa: F401 (probe: sets availability flag)
 except ImportError:    HAS_OPENPYXL = False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2444,6 +2444,166 @@ def _slug(text: str, fallback: str = "company") -> str:
     s = re.sub(r"_+", "_", s)
     return s[:80] or fallback
 
+def write_ccb_disclosure_reports(nuclei_output: str,
+    output_dir: str,
+    lookup: dict,
+    hostname_index: dict,
+    researcher: Optional[dict] = None) -> List[str]:
+    """Write one CCB-style coordinated vulnerability disclosure report per company.
+
+    Structured for good-faith reporting under the Belgian CVDP framework
+    (art. 550bis §5): addressed to the CCB (CSIRT) and the organisation's
+    security/abuse mailbox, factual, no commercial content, no withholding.
+    Every finding the scan produced is listed in full — the safe harbour is
+    conditioned on complete, prompt disclosure, so nothing is held back.
+    """
+    results_path = Path(nuclei_output)
+    if not results_path.exists() or results_path.stat().st_size == 0:
+        return []
+
+    researcher = researcher or _sender_config()
+    functional_by_domain = _load_functional_mailboxes(output_dir)
+    security_by_domain = _load_security_contacts(output_dir)
+
+    companies: Dict[str, dict] = {}
+    for finding in stream_findings(results_path):
+        host = _finding_host(finding)
+        if not host:
+            continue
+        co = _company_record(host, lookup, hostname_index)
+        key = co.get("entity") or co.get("name") or host
+        bucket = companies.setdefault(key, {"company": co, "hosts": {}})
+        bucket["hosts"].setdefault(host, []).append(_finding_summary(finding))
+
+    if not companies:
+        return []
+
+    report_root = Path(output_dir) / "by_company"
+    report_root.mkdir(parents=True, exist_ok=True)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    written: List[str] = []
+
+    for key, data in companies.items():
+        co = data["company"]
+        name = co.get("name") or key
+        # Determine the security/abuse mailbox for this org's domain.
+        first_host = next(iter(data["hosts"]), "")
+        netloc = urlparse(first_host if "://" in first_host
+                          else "http://" + first_host).netloc or first_host
+        domain = netloc.replace("www.", "").strip("/")
+        discovered = functional_by_domain.get(domain, [])
+        sec_mailbox = (security_by_domain.get(domain)
+                       or next((e for e in discovered
+                                if _local_part(e) in
+                                ("security", "abuse", "soc", "cert", "psirt")), "")
+                       or (f"security@{domain}" if domain else "[security mailbox]"))
+        org_to = sec_mailbox
+
+        total = sum(len(v) for v in data["hosts"].values())
+        lines: List[str] = []
+        lines.append("=" * 74)
+        lines.append("COORDINATED VULNERABILITY DISCLOSURE")
+        lines.append("Belgisch kader voor gecoördineerde bekendmaking / "
+                     "Belgian CVDP framework")
+        lines.append("=" * 74)
+        lines.append(f"Datum / Date        : {generated}")
+        lines.append(f"Betrokken organisatie / Affected organisation : {name}")
+        if co.get("entity"):
+            lines.append(f"Ondernemingsnummer / Entity : {co['entity']}")
+        lines.append("")
+        lines.append("AAN / TO:")
+        lines.append("  1. Centre for Cybersecurity Belgium (CCB) — CSIRT")
+        lines.append("     vulnerabilityreport@ccb.belgium.be  |  cert@cert.be")
+        lines.append(f"  2. {name}  <{org_to}>")
+        lines.append("")
+        lines.append("MELDER / REPORTER:")
+        lines.append(f"  {researcher['name']}, {researcher['company']}")
+        lines.append(f"  {researcher['email']}  |  {researcher['phone']}")
+        lines.append("")
+        lines.append("-" * 74)
+        lines.append("AARD VAN DE MELDING / NATURE OF THIS REPORT")
+        lines.append("-" * 74)
+        lines.append(
+            "Deze melding gebeurt te goeder trouw onder het Belgische kader voor")
+        lines.append(
+            "gecoördineerde bekendmaking van kwetsbaarheden (art. 550bis §5 Sw.).")
+        lines.append(
+            "Er is geen toegang genomen tot systemen of gegevens, geen data")
+        lines.append(
+            "gewijzigd of gekopieerd, en niet verder gegaan dan nodig om de")
+        lines.append(
+            "kwetsbaarheid vast te stellen. Deze bevindingen worden niet publiek")
+        lines.append(
+            "gemaakt en niet met derden gedeeld zonder akkoord van het CCB.")
+        lines.append("")
+        lines.append(
+            "This is a good-faith report under the Belgian coordinated "
+            "vulnerability")
+        lines.append(
+            "disclosure framework. No systems or data were accessed, altered or")
+        lines.append(
+            "copied; testing did not go beyond confirming each issue. Findings "
+            "are")
+        lines.append(
+            "shared only with the CCB and the affected organisation.")
+        lines.append("")
+        lines.append(f"Aantal bevindingen / Findings : {total}  "
+                     f"over {len(data['hosts'])} host(s)")
+        lines.append("")
+
+        for host in sorted(data["hosts"]):
+            findings = sorted(
+                data["hosts"][host],
+                key=lambda f: (_SEV_ORDER.get(f.get("severity", "unknown"), 5),
+                               f.get("name", "")))
+            lines.append("-" * 74)
+            lines.append(f"HOST: {host}")
+            lines.append("-" * 74)
+            for i, f in enumerate(findings, 1):
+                title = f.get("name") or f.get("check") or f.get("template") or "Finding"
+                lines.append(f"[{i}] {title}   ({f.get('severity', 'unknown').upper()})")
+                if f.get("matched_at"):
+                    lines.append(f"    Locatie / Location : {f['matched_at']}")
+                if f.get("evidence"):
+                    lines.append(f"    Bewijs / Evidence  : {f['evidence']}")
+                if f.get("risk"):
+                    lines.append(f"    Risico / Risk      : {f['risk']}")
+                if f.get("remediation"):
+                    lines.append(f"    Herstel / Remediation : {f['remediation']}")
+                lines.append("")
+
+        lines.append("-" * 74)
+        lines.append("VOLGENDE STAPPEN / NEXT STEPS")
+        lines.append("-" * 74)
+        lines.append(
+            "Het CCB coördineert de verdere opvolging. De organisatie wordt")
+        lines.append(
+            "verzocht de bevindingen te verifiëren en te herstellen. Er is geen")
+        lines.append(
+            "actie of betaling vereist tegenover de melder; dit rapport dient")
+        lines.append(
+            "uitsluitend ter beveiliging.")
+        lines.append("")
+        lines.append(
+            "The CCB coordinates follow-up. No action toward or payment to the")
+        lines.append(
+            "reporter is required; this report exists solely to improve security.")
+
+        slug = _slug(name)
+        company_dir = report_root / slug
+        company_dir.mkdir(parents=True, exist_ok=True)
+        fpath = company_dir / f"ccb_disclosure_{slug}.txt"
+        n = 2
+        while fpath.exists():
+            fpath = company_dir / f"ccb_disclosure_{slug}_{n}.txt"
+            n += 1
+        fpath.write_text("\n".join(lines), encoding="utf-8")
+        written.append(str(fpath))
+
+    if written:
+        ok(f"Wrote {len(written)} CCB disclosure report(s) → {report_root}")
+    return written
+
 def write_company_findings_reports(nuclei_output: str,
     output_dir: str,
     lookup: dict,
@@ -2627,6 +2787,25 @@ def _load_functional_mailboxes(output_dir: str) -> Dict[str, List[str]]:
         fem = org.get("functional_emails") or []
         if dom and fem:
             out[dom] = fem
+    return out
+
+def _load_security_contacts(output_dir: str) -> Dict[str, str]:
+    """domain -> declared/best security contact, from contact_enrichment.json."""
+    out: Dict[str, str] = {}
+    p = Path(output_dir) / "contact_enrichment.json"
+    if not p.exists():
+        return out
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    orgs = data if isinstance(data, list) else [data]
+    for entry in orgs:
+        org = entry.get("org", entry) if isinstance(entry, dict) else {}
+        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
+        sc = str(org.get("security_contact", "")).strip()
+        if dom and sc:
+            out[dom] = sc
     return out
 
 def write_intro_emails(scanned_hosts: List[str],
@@ -3678,6 +3857,9 @@ class CIOrgProfile:
     org_email:     str  = ""
     email_pattern: str  = ""
     functional_emails: list = _field(default_factory=list)
+    security_contact: str = ""
+    security_policy:  str = ""
+    network_abuse:    str = ""
     contacts:      list = _field(default_factory=list)
 
 # Functional/role mailboxes, in priority order for security & NIS2 outreach.
@@ -4645,43 +4827,236 @@ def ci_smtp_verify(email: str, mx_host: Optional[str] = None) -> str:
 
     # ── Functional mailbox discovery ──────────────────────────────────────
 
+_SECURITY_TXT_PATHS = ["/.well-known/security.txt", "/security.txt"]
+
+# Dedicated pages that commonly publish a functional/compliance mailbox.
+_CONTACT_PAGES = ["/contact", "/contacts", "/contact-us", "/privacy",
+                  "/privacybeleid", "/privacy-policy", "/gdpr", "/avg",
+                  "/dpo", "/klokkenluider", "/security", "/legal",
+                  "/over-ons", "/about"]
+
+def _emails_on_domain(text: str, domain: str) -> List[str]:
+    out = []
+    for e in re.findall(r"[\w.+%-]+@[\w.-]+\.\w+", text or ""):
+        el = e.lower()
+        if el.endswith("@" + domain) or el.endswith("." + domain):
+            if el not in out:
+                out.append(el)
+    return out
+
+def soa_rname_email(domain: str) -> str:
+    """The SOA record's responsible-person mailbox (RNAME), dots-to-@ decoded."""
+    if not _CI_DNS or not domain:
+        return ""
+    try:
+        ans = _dns_resolver.resolve(domain, "SOA")
+        rname = str(ans[0].rname).rstrip(".")
+    except Exception:
+        return ""
+    # First unescaped dot separates local-part from domain.
+    parts = re.split(r"(?<!\\)\.", rname, maxsplit=1)
+    if len(parts) == 2:
+        local = parts[0].replace("\\.", ".")
+        return f"{local}@{parts[1]}".lower()
+    return ""
+
+def dmarc_report_emails(domain: str) -> List[str]:
+    """Mailboxes from the _dmarc TXT record's rua/ruf report addresses."""
+    if not _CI_DNS or not domain:
+        return []
+    try:
+        ans = _dns_resolver.resolve(f"_dmarc.{domain}", "TXT")
+    except Exception:
+        return []
+    txt = " ".join(b.decode(errors="replace") if isinstance(b, bytes) else str(b)
+                   for r in ans for b in r.strings)
+    out = []
+    for m in re.findall(r"(?:rua|ruf)=([^;]+)", txt, re.I):
+        for addr in m.split(","):
+            addr = addr.strip()
+            if addr.lower().startswith("mailto:"):
+                e = addr[7:].strip().lower()
+                if "@" in e and e not in out:
+                    out.append(e)
+    return out
+
+def tls_cert_emails(domain: str) -> List[str]:
+    """Any emailAddress fields in the site's TLS certificate subject/SANs."""
+    if not domain:
+        return []
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    out = []
+    try:
+        with socket.create_connection((domain, 443), timeout=6) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ss:
+                cert = ss.getpeercert()
+    except Exception:
+        return []
+    for field in cert.get("subject", ()) + cert.get("issuer", ()):
+        for k, v in field:
+            if k == "emailAddress" and "@" in v:
+                out.append(v.lower())
+    for typ, val in cert.get("subjectAltName", ()):
+        if typ.lower() == "email" and "@" in val:
+            out.append(val.lower())
+    return list(dict.fromkeys(out))
+
+def whois_abuse_mailbox(domain: str) -> str:
+    """RIPE abuse-c mailbox for the IP the domain resolves to.
+
+    This is the *hosting network's* abuse desk (mandated in the RIPE region),
+    correct for network-abuse reports but NOT the organisation's own inbox.
+    """
+    try:
+        ip = socket.gethostbyname(domain)
+    except Exception:
+        return ""
+    def _q(server, query):
+        try:
+            with socket.create_connection((server, 43), timeout=6) as s:
+                s.sendall((query + "\r\n").encode())
+                buf = b""
+                while True:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+                return buf.decode(errors="replace")
+        except Exception:
+            return ""
+    # RIPE returns abuse-mailbox directly with the -b flag.
+    text = _q("whois.ripe.net", f"-b {ip}")
+    m = re.search(r"abuse-mailbox:\s*([\w.+%-]+@[\w.-]+\.\w+)", text, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"%\s*Abuse contact for.*?is\s*'([\w.+%-]+@[\w.-]+\.\w+)'",
+                  text, re.I | re.S)
+    return m.group(1).lower() if m else ""
+
+def scrape_contact_pages(domain: str, proxies: dict, delay: float) -> List[str]:
+    """Functional mailboxes published on dedicated contact/privacy/DPO pages."""
+    if not _CI_HTTP or not domain:
+        return []
+    out: List[str] = []
+    for path in _CONTACT_PAGES:
+        if len([e for e in out if _is_functional(e)]) >= 3:
+            break  # enough signal; don't fetch every page
+        r = _ci_get(f"https://{domain}{path}", proxies, delay * 0.25)
+        if not r or getattr(r, "status_code", 0) != 200:
+            continue
+        soup = _ci_soup(r)
+        for a in soup.find_all("a", href=re.compile(r"mailto:", re.I)):
+            raw = a["href"].replace("mailto:", "").split("?")[0].strip().lower()
+            if raw.endswith("@" + domain) and raw not in out:
+                out.append(raw)
+        for e in _emails_on_domain(soup.get_text(" ", strip=True), domain):
+            if e not in out:
+                out.append(e)
+    # Keep only functional addresses; discard scraped personal ones here.
+    return [e for e in out if _is_functional(e)]
+
+def fetch_security_txt(domain: str, proxies: dict, delay: float) -> dict:
+    """Fetch and parse RFC 9116 security.txt — the canonical, purpose-built
+    place an organisation declares where to report vulnerabilities.
+
+    Returns {"contacts": [emails...], "policy": url, "found": bool}. Contacts
+    are the authoritative vulnerability-report addresses when present.
+    """
+    out = {"contacts": [], "policy": "", "found": False}
+    if not _CI_HTTP or not domain:
+        return out
+    for scheme in ("https", "http"):
+        for path in _SECURITY_TXT_PATHS:
+            r = _ci_get(f"{scheme}://{domain}{path}", proxies, delay * 0.3)
+            if not r or getattr(r, "status_code", 0) != 200:
+                continue
+            body = r.text or ""
+            # Guard against soft-404 HTML pages served for missing files.
+            if "<html" in body[:200].lower():
+                continue
+            for line in body.splitlines():
+                line = line.strip()
+                low = line.lower()
+                if low.startswith("contact:"):
+                    val = line.split(":", 1)[1].strip()
+                    if val.lower().startswith("mailto:"):
+                        val = val[7:].strip()
+                    if "@" in val and " " not in val:
+                        e = val.lower()
+                        if e not in out["contacts"]:
+                            out["contacts"].append(e)
+                elif low.startswith("policy:") and not out["policy"]:
+                    out["policy"] = line.split(":", 1)[1].strip()
+            if out["contacts"] or out["policy"]:
+                out["found"] = True
+                return out
+    return out
+
 def discover_functional_mailboxes(domain: str,
     scraped: Optional[List[str]] = None,
-    no_smtp: bool = False) -> List[str]:
+    no_smtp: bool = False,
+    extra: Optional[List[str]] = None) -> List[str]:
     """Return ranked functional/role mailboxes for a domain.
 
-    Prefers addresses actually found on the site. When SMTP probing is enabled,
-    also tests the highest-value NIS2/security candidates (security@, abuse@,
-    privacy@, dpo@, contact@, info@) and keeps those the mail server accepts.
-    With --no-smtp, returns only what was scraped plus a small set of proposed
-    candidates tagged as unverified, so nothing is asserted that wasn't seen.
+    Order of authority: security.txt-declared contacts (passed as `extra`)
+    first, then addresses found on the site, then SMTP-confirmed standard
+    aliases. RFC 2142 mandates abuse@ and postmaster@ exist for a domain, so
+    those are probed alongside security@/privacy@. With --no-smtp, only
+    scraped + declared addresses are returned plus a couple of proposed
+    general mailboxes, so nothing unseen is asserted.
     """
     domain = (domain or "").strip().lower().replace("www.", "")
     if not domain:
         return []
-    found = _rank_functional(e for e in (scraped or []) if _is_functional(e))
-    have_local = {_local_part(e) for e in found}
 
-    # Highest-value candidates to confirm when we're allowed to probe.
-    candidates = ["security", "abuse", "privacy", "dpo",
-                  "contact", "info"]
+    ordered: List[str] = []
+    def _add(e):
+        el = (e or "").strip().lower()
+        if el and "@" in el and el not in ordered:
+            ordered.append(el)
+
+    # 1. Authoritative security.txt contacts on the same domain, first.
+    for e in (extra or []):
+        if e.split("@")[-1].endswith(domain) or e.endswith("@" + domain):
+            _add(e)
+    for e in (extra or []):
+        _add(e)  # keep off-domain declared contacts too (e.g. a CSIRT alias)
+
+    # 2. Functional addresses actually scraped from the site.
+    for e in _rank_functional(x for x in (scraped or []) if _is_functional(x)):
+        _add(e)
+    have_local = {_local_part(e) for e in ordered}
+
     if no_smtp:
-        # Don't assert unseen addresses exist; propose the top general ones.
-        proposed = [f"{p}@{domain}" for p in ("contact", "info")
-                    if p not in have_local]
-        return found + proposed
+        for p in ("contact", "info"):
+            if p not in have_local:
+                _add(f"{p}@{domain}")
+        return ordered
 
     mx = _ci_mx_for(domain)
     if not mx:
-        return found
-    for p in candidates:
+        return ordered
+    # RFC 2142 mandatory aliases (abuse@, postmaster@) + security/privacy.
+    for p in ("security", "abuse", "postmaster", "privacy", "dpo",
+              "contact", "info"):
         if p in have_local:
             continue
-        addr = f"{p}@{domain}"
-        if ci_smtp_verify(addr, mx) == "smtp-ok":
-            found.append(addr)
+        if ci_smtp_verify(f"{p}@{domain}", mx) == "smtp-ok":
+            _add(f"{p}@{domain}")
             have_local.add(p)
-    return _rank_functional(found)
+    return ordered
+
+def _pick_security_contact(emails: List[str], sectxt_contacts: List[str]) -> str:
+    """Best vulnerability-report address: a security.txt contact if any,
+    else a security/abuse/soc/cert mailbox, else empty."""
+    for e in sectxt_contacts:
+        if "@" in e:
+            return e.lower()
+    for e in emails:
+        if _local_part(e) in ("security", "abuse", "soc", "cert", "psirt"):
+            return e
+    return ""
 
     # ── Scoring ───────────────────────────────────────────────────────────
 
@@ -4744,13 +5119,39 @@ def ci_run_single(kbo: str, domain: str,
         org.org_phone = web_data["phones"][0]
 
     # Functional / role mailboxes — preferred, non-personal contact channel.
+    # Aggregate sources by authority: security.txt (declared) is authoritative;
+    # DMARC rua, SOA RNAME, TLS cert and dedicated pages add same-domain
+    # mailboxes; RIPE abuse-c is the hosting network's desk, kept separate.
+    sectxt = fetch_security_txt(domain, proxies, delay)
+    authoritative = list(sectxt.get("contacts", []))
+    same_domain: List[str] = []
+    for src in (dmarc_report_emails(domain),
+                tls_cert_emails(domain),
+                scrape_contact_pages(domain, proxies, delay)):
+        for e in src:
+            if e.endswith("@" + domain) and e not in same_domain:
+                same_domain.append(e)
+    soa = soa_rname_email(domain)
+    if soa and soa.endswith("@" + domain) and soa not in same_domain:
+        same_domain.append(soa)
+
     org.functional_emails = discover_functional_mailboxes(
-        domain, web_data.get("functional", []), no_smtp)
+        domain, web_data.get("functional", []), no_smtp,
+        extra=authoritative + same_domain)
+    org.security_contact = _pick_security_contact(
+        org.functional_emails, sectxt.get("contacts", []))
+    org.security_policy = sectxt.get("policy", "")
+    org.network_abuse = whois_abuse_mailbox(domain)
     if org.functional_emails and not org.org_email:
         org.org_email = org.functional_emails[0]
     if not org.org_email:
         org.org_email = next(
             (e for e in web_data["emails"] if _is_functional(e)), "")
+    if org.security_contact:
+        detail(f"security contact: {org.security_contact}"
+               + ("  (security.txt)" if sectxt.get("found") else ""))
+    if org.network_abuse:
+        detail(f"network abuse desk (host): {org.network_abuse}")
     if org.functional_emails:
         detail("functional mailboxes: " + ", ".join(org.functional_emails[:6]))
 
@@ -5042,6 +5443,9 @@ def ci_export_json(org: CIOrgProfile, path: str) -> None:
             "phone": org.org_phone, "email": org.org_email,
             "email_pattern": org.email_pattern,
             "functional_emails": org.functional_emails,
+            "security_contact": org.security_contact,
+            "security_policy": org.security_policy,
+            "network_abuse": org.network_abuse,
             "address": org.address},
             "contacts": [
             {"score": c.score, "name": c.name, "role": c.role,
@@ -5065,89 +5469,9 @@ def ci_export_html(orgs: list, findings_path: str, output_path: str) -> None:
     - Printable, no external dependencies
     """
 
-    # Per-matcher human-readable descriptions (nuclei strips these from YAML)
-    _MATCHER_DESC: Dict[str, str] = {
-        "missing-hsts":                   "Strict-Transport-Security not set — no HTTPS enforcement",
-        "weak-hsts-max-age":              "HSTS max-age < 1 year — short expiry reduces protection",
-        "hsts-missing-includesubdomains": "HSTS present but missing includeSubDomains — subdomains unprotected",
-        "missing-csp":                    "No Content-Security-Policy — XSS protection policy absent",
-        "weak-csp-unsafe-inline":         "CSP allows unsafe-inline — inline script execution permitted",
-        "weak-csp-unsafe-eval":           "CSP allows unsafe-eval — eval() and similar not blocked",
-        "missing-x-frame-options":        "No X-Frame-Options and no CSP frame-ancestors — clickjacking possible",
-        "missing-x-content-type-options": "X-Content-Type-Options: nosniff not set — MIME sniffing enabled",
-        "missing-referrer-policy":        "No Referrer-Policy — full URLs may leak to third parties",
-        "missing-permissions-policy":     "No Permissions-Policy — camera/mic/geo access unrestricted",
-        "missing-cache-control":          "No Cache-Control — responses may be cached by proxies",
-        "missing-coop":                   "No Cross-Origin-Opener-Policy — Spectre-class attacks possible",
-        "missing-corp":                   "No Cross-Origin-Resource-Policy — resources readable cross-origin",
-        "cookie-missing-secure":          "Cookie set without Secure flag — transmitted over plain HTTP",
-        "cookie-missing-httponly":        "Cookie set without HttpOnly — readable by JavaScript (XSS risk)",
-        "cookie-missing-samesite":        "Cookie set without SameSite — CSRF attack surface",
-        "cors-wildcard-origin":           "CORS wildcard (*) — any origin can read responses",
-        "cors-reflects-origin":           "CORS reflects arbitrary Origin header — credentials leakable",
-        "server-version-disclosure":      "Server header exposes software version — aids targeted attacks",
-        "x-powered-by-disclosure":        "X-Powered-By header reveals backend technology stack",
-        "aspnet-version-disclosure":      "ASP.NET version header present — exact .NET runtime exposed",
-        "internal-ip-in-headers":         "RFC1918 internal IP address found in response headers",
-        "generator-meta-disclosure":      "HTML meta generator tag reveals CMS name and version",
-        "tech-wordpress":                 "WordPress CMS detected — check for outdated plugins/themes",
-        "tech-joomla":                    "Joomla CMS detected — check version and extensions",
-        "tech-drupal":                    "Drupal CMS detected — check version and modules",
-        "tech-sharepoint":                "Microsoft SharePoint detected",
-        "tech-jquery-version":            "jQuery version detectable — verify it is not end-of-life",
-        "mixed-content-http-resource":    "HTTPS page loads resources over HTTP — mixed content warning",
-        "external-script-detected":       "External script loaded without Subresource Integrity (SRI)",
-        "stack-trace-disclosure":         "Stack trace or exception detail visible in response body",
-        "debug-mode-indicators":          "Debug mode or development environment indicators in response",
-        "sensitive-paths-disclosed":      "robots.txt lists sensitive paths (admin/api/backup/config…)",
-        "ssl-certificate-expired":        "TLS certificate has passed its expiry date",
-        "ssl-certificate-expiring-30d":   "TLS certificate expires within 30 days — renew urgently",
-        "ssl-certificate-expiring-90d":   "TLS certificate expires within 90 days — plan renewal",
-        "ssl-self-signed":                "Certificate is self-signed — not trusted by browsers",
-        "ssl-weak-protocol":              "Server negotiated deprecated TLS 1.0 or TLS 1.1",
-        "ssl-hostname-mismatch":          "Certificate CN/SAN does not match the hostname",
-    }
-    _MATCHER_REMEDIATION: Dict[str, str] = {
-        "missing-hsts":                   "Enable HSTS with a long max-age (>=31536000) and include subdomains.",
-        "weak-hsts-max-age":              "Increase HSTS max-age to at least one year and preload when applicable.",
-        "hsts-missing-includesubdomains": "Add includeSubDomains to HSTS after validating all subdomains support HTTPS.",
-        "missing-csp":                    "Deploy a strict CSP using nonces/hashes and remove inline script allowances.",
-        "weak-csp-unsafe-inline":         "Remove unsafe-inline and migrate scripts/styles to nonce/hash-based policies.",
-        "weak-csp-unsafe-eval":           "Remove unsafe-eval and refactor code paths that rely on dynamic eval behavior.",
-        "missing-x-frame-options":        "Block framing with X-Frame-Options DENY or CSP frame-ancestors.",
-        "missing-x-content-type-options": "Set X-Content-Type-Options to nosniff on all HTTP responses.",
-        "missing-referrer-policy":        "Set a restrictive Referrer-Policy such as strict-origin-when-cross-origin.",
-        "missing-permissions-policy":     "Define a restrictive Permissions-Policy and disable unused browser features.",
-        "missing-cache-control":          "Set Cache-Control directives, especially no-store for sensitive pages/data.",
-        "missing-coop":                   "Set Cross-Origin-Opener-Policy to same-origin unless isolation requires otherwise.",
-        "missing-corp":                   "Set Cross-Origin-Resource-Policy to same-site or same-origin where feasible.",
-        "cookie-missing-secure":          "Mark cookies Secure and enforce HTTPS across every authenticated endpoint.",
-        "cookie-missing-httponly":        "Mark session cookies HttpOnly to reduce credential theft via XSS.",
-        "cookie-missing-samesite":        "Set SameSite=Lax/Strict for session cookies and review CSRF protections.",
-        "cors-wildcard-origin":           "Replace wildcard CORS with an explicit allow-list of trusted origins.",
-        "cors-reflects-origin":           "Stop reflecting arbitrary Origin values and validate against a strict allow-list.",
-        "server-version-disclosure":      "Suppress version headers and keep the stack patched to current stable versions.",
-        "x-powered-by-disclosure":        "Remove X-Powered-By and other framework disclosure headers in production.",
-        "aspnet-version-disclosure":      "Disable ASP.NET version disclosure headers and verify hardened defaults.",
-        "internal-ip-in-headers":         "Remove internal addressing from responses and sanitize upstream proxy headers.",
-        "generator-meta-disclosure":      "Remove generator/version metadata from HTML and update CMS regularly.",
-        "tech-wordpress":                 "Patch WordPress core, themes, and plugins; remove unused extensions.",
-        "tech-joomla":                    "Update Joomla core/extensions and remove unsupported or unused modules.",
-        "tech-drupal":                    "Update Drupal core/modules and apply vendor security advisories promptly.",
-        "tech-sharepoint":                "Apply latest SharePoint security updates and harden internet-facing services.",
-        "tech-jquery-version":            "Upgrade to a supported jQuery release and retest compatibility.",
-        "mixed-content-http-resource":    "Serve all resources over HTTPS and enforce upgrades via CSP upgrade-insecure-requests.",
-        "external-script-detected":       "Pin external scripts with Subresource Integrity and restrict via CSP.",
-        "stack-trace-disclosure":         "Disable verbose errors in production and route details to protected logs.",
-        "debug-mode-indicators":          "Disable debug/development modes in production configuration.",
-        "sensitive-paths-disclosed":      "Remove sensitive paths from robots.txt and protect endpoints with auth/ACLs.",
-        "ssl-certificate-expired":        "Replace expired certificates immediately and validate full certificate chain.",
-        "ssl-certificate-expiring-30d":   "Renew certificates now and verify automated renewal monitoring.",
-        "ssl-certificate-expiring-90d":   "Schedule certificate renewal and enable expiry alerting.",
-        "ssl-self-signed":                "Use a trusted CA-issued certificate for public-facing services.",
-        "ssl-weak-protocol":              "Disable TLS 1.0/1.1 and enforce TLS 1.2+ with modern ciphers.",
-        "ssl-hostname-mismatch":          "Reissue certificate with correct SAN/CN entries for served hostnames.",
-    }
+    # Finding descriptions and remediations come from the canonical
+    # module-level FINDING_MATCHER_* tables via _finding_remediation()
+    # and _finding_summary(); no local copy is kept here.
     # Load findings grouped by host
     findings_by_host: Dict[str, list] = {}
     p = Path(findings_path)
@@ -6617,6 +6941,13 @@ def parse_args():
                          "per company under by_company/. When set, delivery and "
                          "upload send ONLY the per-company tree, so no delivered "
                          "file spans multiple companies.")
+    sp.add_argument("--ccb-disclosure", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Write a CCB-style coordinated vulnerability disclosure "
+                         "report per company (addressed to the CCB/CSIRT and the "
+                         "org's security mailbox; factual, no commercial content). "
+                         "On by default; use --no-ccb-disclosure to skip. "
+                         "Reporter identity from SENDER_* env vars.")
     sp.add_argument("--scan-ledger", default=SCAN_LEDGER_DEFAULT, metavar="PATH",
                     help=f"Global ledger of scanned targets, shared across "
                          f"campaigns (default: {SCAN_LEDGER_DEFAULT}). Targets "
@@ -7122,6 +7453,11 @@ def main():
             nuclei_output, args.output_dir, _lookup, _hidx)
         step_end()
         delivered_extra = list(findings_reports)
+        if args.ccb_disclosure:
+            step_start("CCB disclosure reports")
+            delivered_extra += write_ccb_disclosure_reports(
+                nuclei_output, args.output_dir, _lookup, _hidx)
+            step_end()
         if args.intro_emails:
             step_start("Intro emails")
             delivered_extra += write_intro_emails(
@@ -7196,6 +7532,11 @@ def main():
     step_end()
 
     delivered_extra = list(findings_reports)
+    if args.ccb_disclosure:
+        step_start("CCB disclosure reports")
+        delivered_extra += write_ccb_disclosure_reports(
+            nuclei_output, args.output_dir, _lookup, _hidx)
+        step_end()
     if args.intro_emails:
         step_start("Intro emails")
         delivered_extra += write_intro_emails(
