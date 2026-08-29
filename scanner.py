@@ -69,7 +69,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 import urllib.request
 import urllib.error
@@ -2607,6 +2607,28 @@ def _intro_email_text(company_name: str, to_addr: str, sender: dict) -> str:
     ]
     return "\n".join(lines)
 
+def _load_functional_mailboxes(output_dir: str) -> Dict[str, List[str]]:
+    """domain -> ranked functional mailboxes, from contact_enrichment.json.
+
+    Returns an empty map if enrichment hasn't run, so intro emails still work.
+    """
+    out: Dict[str, List[str]] = {}
+    p = Path(output_dir) / "contact_enrichment.json"
+    if not p.exists():
+        return out
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    orgs = data if isinstance(data, list) else [data]
+    for entry in orgs:
+        org = entry.get("org", entry) if isinstance(entry, dict) else {}
+        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
+        fem = org.get("functional_emails") or []
+        if dom and fem:
+            out[dom] = fem
+    return out
+
 def write_intro_emails(scanned_hosts: List[str],
     output_dir: str,
     lookup: dict,
@@ -2614,6 +2636,7 @@ def write_intro_emails(scanned_hosts: List[str],
     sender: Optional[dict] = None) -> List[str]:
     """Write one Dutch B2B intro email per scanned company (general mailbox)."""
     sender = sender or _sender_config()
+    functional_by_domain = _load_functional_mailboxes(output_dir)
     companies: Dict[str, dict] = {}
     for host in (scanned_hosts or []):
         co = _company_record(host, lookup, hostname_index)
@@ -2631,7 +2654,13 @@ def write_intro_emails(scanned_hosts: List[str],
         name = co.get("name") or "uw organisatie"
         netloc = urlparse(host if "://" in host else "http://" + host).netloc or host
         domain = netloc.replace("www.", "").strip("/")
-        to_addr = f"info@{domain}" if domain else ""
+        # Prefer a discovered functional mailbox (contact@/info@, not security@
+        # or a person) for a service introduction; fall back to info@domain.
+        discovered = functional_by_domain.get(domain, [])
+        intro_pref = [e for e in discovered
+                      if _local_part(e) in ("contact", "info", "hello", "onthaal")]
+        to_addr = (intro_pref[0] if intro_pref
+                   else (f"info@{domain}" if domain else ""))
         body = _intro_email_text(name, to_addr, sender)
         slug = _slug(name)
         company_dir = report_root / slug
@@ -3648,7 +3677,43 @@ class CIOrgProfile:
     org_phone:     str  = ""
     org_email:     str  = ""
     email_pattern: str  = ""
+    functional_emails: list = _field(default_factory=list)
     contacts:      list = _field(default_factory=list)
+
+# Functional/role mailboxes, in priority order for security & NIS2 outreach.
+# These are not personal data about an identifiable individual, which makes
+# them the preferred contact channel over an inferred person's address.
+_FUNCTIONAL_PREFIXES = [
+    "security", "abuse", "soc", "cert",           # security reporting
+    "privacy", "dpo", "gdpr", "compliance",       # data protection
+    "it", "ict", "helpdesk", "support",           # technical
+    "contact", "info", "hello", "onthaal",        # general
+    "secretariaat", "administratie", "office",    # admin (NL/BE)
+]
+_FUNCTIONAL_RANK = {p: i for i, p in enumerate(_FUNCTIONAL_PREFIXES)}
+
+def _local_part(email: str) -> str:
+    return email.split("@", 1)[0].strip().lower() if "@" in email else ""
+
+def _is_functional(email: str) -> bool:
+    lp = _local_part(email)
+    return any(lp == p or lp.startswith(p + ".") or lp.startswith(p + "-")
+               for p in _FUNCTIONAL_PREFIXES)
+
+def _rank_functional(emails: Iterable[str]) -> List[str]:
+    def key(e):
+        lp = _local_part(e)
+        for p in _FUNCTIONAL_PREFIXES:
+            if lp == p or lp.startswith(p + ".") or lp.startswith(p + "-"):
+                return (_FUNCTIONAL_RANK[p], e)
+        return (len(_FUNCTIONAL_PREFIXES), e)
+    seen, out = set(), []
+    for e in sorted(set(emails), key=key):
+        el = e.lower()
+        if el not in seen:
+            seen.add(el)
+            out.append(e)
+    return out
 
     # ── HTTP helper ───────────────────────────────────────────────────────
 
@@ -3906,7 +3971,8 @@ def ci_fetch_kbo(kbo: str, proxies: dict, delay: float) -> dict:
     # ── 2. Website scraper ────────────────────────────────────────────────
 
 def ci_scrape_website(domain: str, proxies: dict, delay: float) -> dict:
-    out = {"staff": [], "board": [], "emails": [], "phones": [], "pattern": ""}
+    out = {"staff": [], "board": [], "emails": [], "phones": [], "pattern": "",
+           "functional": []}
     if not _CI_HTTP:
         return out
 
@@ -3957,12 +4023,15 @@ def ci_scrape_website(domain: str, proxies: dict, delay: float) -> dict:
 
     personal = [e for e in out["emails"]
                 if "." in e.split("@")[0]
-                and not e.startswith(("info@", "contact@", "admin@"))]
+                and not _is_functional(e)]
     out["pattern"] = f"voornaam.naam@{domain}" if personal else ""
+    out["functional"] = _rank_functional(
+        e for e in out["emails"] if _is_functional(e))
     dedup = lambda lst: list({e["name"]: e for e in lst}.values())
     out["staff"] = dedup(out["staff"])
     out["board"]  = dedup(out["board"])
-    info(f"[CI-WEB] {len(out['emails'])} emails, {len(out['phones'])} phones, "
+    info(f"[CI-WEB] {len(out['emails'])} emails "
+         f"({len(out['functional'])} functional), {len(out['phones'])} phones, "
          f"{len(out['staff'])} staff, {len(out['board'])} board entries")
     return out
 
@@ -4574,6 +4643,46 @@ def ci_smtp_verify(email: str, mx_host: Optional[str] = None) -> str:
     except Exception:
         return "smtp-unknown"
 
+    # ── Functional mailbox discovery ──────────────────────────────────────
+
+def discover_functional_mailboxes(domain: str,
+    scraped: Optional[List[str]] = None,
+    no_smtp: bool = False) -> List[str]:
+    """Return ranked functional/role mailboxes for a domain.
+
+    Prefers addresses actually found on the site. When SMTP probing is enabled,
+    also tests the highest-value NIS2/security candidates (security@, abuse@,
+    privacy@, dpo@, contact@, info@) and keeps those the mail server accepts.
+    With --no-smtp, returns only what was scraped plus a small set of proposed
+    candidates tagged as unverified, so nothing is asserted that wasn't seen.
+    """
+    domain = (domain or "").strip().lower().replace("www.", "")
+    if not domain:
+        return []
+    found = _rank_functional(e for e in (scraped or []) if _is_functional(e))
+    have_local = {_local_part(e) for e in found}
+
+    # Highest-value candidates to confirm when we're allowed to probe.
+    candidates = ["security", "abuse", "privacy", "dpo",
+                  "contact", "info"]
+    if no_smtp:
+        # Don't assert unseen addresses exist; propose the top general ones.
+        proposed = [f"{p}@{domain}" for p in ("contact", "info")
+                    if p not in have_local]
+        return found + proposed
+
+    mx = _ci_mx_for(domain)
+    if not mx:
+        return found
+    for p in candidates:
+        if p in have_local:
+            continue
+        addr = f"{p}@{domain}"
+        if ci_smtp_verify(addr, mx) == "smtp-ok":
+            found.append(addr)
+            have_local.add(p)
+    return _rank_functional(found)
+
     # ── Scoring ───────────────────────────────────────────────────────────
 
 def ci_score(c: CIContact) -> int:
@@ -4633,10 +4742,17 @@ def ci_run_single(kbo: str, domain: str,
     org.email_pattern = web_data.get("pattern") or f"voornaam.naam@{domain}"
     if not org.org_phone and web_data["phones"]:
         org.org_phone = web_data["phones"][0]
+
+    # Functional / role mailboxes — preferred, non-personal contact channel.
+    org.functional_emails = discover_functional_mailboxes(
+        domain, web_data.get("functional", []), no_smtp)
+    if org.functional_emails and not org.org_email:
+        org.org_email = org.functional_emails[0]
     if not org.org_email:
         org.org_email = next(
-            (e for e in web_data["emails"]
-             if e.startswith(("info@", "contact@"))), "")
+            (e for e in web_data["emails"] if _is_functional(e)), "")
+    if org.functional_emails:
+        detail("functional mailboxes: " + ", ".join(org.functional_emails[:6]))
 
     # 3 Staatsblad
     header("[CI] Step 3/9  Staatsblad")
@@ -4886,7 +5002,8 @@ def ci_print_report(org: CIOrgProfile) -> None:
         print()
 
 def ci_export_csv(org: CIOrgProfile, path: str) -> None:
-    fields = ["score", "kbo", "org_name", "domain", "name", "role",
+    fields = ["score", "kbo", "org_name", "domain", "org_functional_emails",
+    "name", "role",
     "linkedin_role", "email", "email_status",
     "phone", "phone_type", "linkedin_url", "linkedin_search_url",
     "sources", "notes"]
@@ -4900,6 +5017,7 @@ def ci_export_csv(org: CIOrgProfile, path: str) -> None:
                 "kbo":                 org.kbo,
                 "org_name":            org.name,
                 "domain":              org.domain,
+                "org_functional_emails": " | ".join(org.functional_emails),
                 "name":                c.name,
                 "role":                c.role,
                 "linkedin_role":       c.linkedin_role,
@@ -4923,6 +5041,7 @@ def ci_export_json(org: CIOrgProfile, path: str) -> None:
             "org": {"kbo": org.kbo, "name": org.name, "domain": org.domain,
             "phone": org.org_phone, "email": org.org_email,
             "email_pattern": org.email_pattern,
+            "functional_emails": org.functional_emails,
             "address": org.address},
             "contacts": [
             {"score": c.score, "name": c.name, "role": c.role,
@@ -5679,6 +5798,142 @@ class _SharePointClient:
         return web_url
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Scan ledger — global record of scanned targets, campaign-independent.
+# Deduplicates so a target is never scanned twice across campaigns. The
+# local file is the source of truth for the check; a copy is pushed to a
+# FIXED SharePoint path (overwrite) each run.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCAN_LEDGER_DEFAULT = "scan_ledger.csv"
+_LEDGER_FIELDS = ["domain", "entity", "company", "sector",
+                  "first_scanned", "last_scanned", "scan_count",
+                  "last_campaign", "last_findings"]
+
+def _ledger_key(url_or_host: str) -> str:
+    s = str(url_or_host or "").strip().lower()
+    if not s:
+        return ""
+    netloc = urlparse(s if "://" in s else "http://" + s).netloc or s
+    return netloc.replace("www.", "").strip("/")
+
+def load_scan_ledger(path: str) -> Dict[str, dict]:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    out: Dict[str, dict] = {}
+    try:
+        with open(p, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                k = (row.get("domain") or "").strip().lower()
+                if k:
+                    out[k] = row
+    except Exception as e:  # noqa: BLE001
+        warn(f"Could not read scan ledger {path}: {e}")
+    return out
+
+def filter_unscanned(urls: List[str], ledger: Dict[str, dict]
+                     ) -> Tuple[List[str], List[str]]:
+    to_scan, skipped = [], []
+    seen = set()
+    for u in urls:
+        k = _ledger_key(u)
+        if k and k in ledger:
+            skipped.append(u)
+        elif k and k in seen:
+            continue
+        else:
+            seen.add(k)
+            to_scan.append(u)
+    return to_scan, skipped
+
+def _findings_count_by_domain(nuclei_output: str) -> Counter:
+    counts: Counter = Counter()
+    p = Path(nuclei_output)
+    if p.exists() and p.stat().st_size > 0:
+        for finding in stream_findings(p):
+            counts[_ledger_key(_finding_host(finding))] += 1
+    return counts
+
+def update_scan_ledger(path: str,
+    scanned_urls: List[str],
+    lookup: dict,
+    hostname_index: dict,
+    campaign: str,
+    nuclei_output: str) -> str:
+    """Append/refresh ledger rows for the targets scanned this run, then
+    rewrite the file atomically. Idempotent per domain (scan_count increments)."""
+    ledger = load_scan_ledger(path)
+    counts = _findings_count_by_domain(nuclei_output)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    for u in scanned_urls:
+        k = _ledger_key(u)
+        if not k:
+            continue
+        co = _company_record(u, lookup, hostname_index)
+        row = ledger.get(k, {"domain": k, "first_scanned": now, "scan_count": "0"})
+        row["entity"]  = co.get("entity") or row.get("entity", "")
+        row["company"] = co.get("name") or row.get("company", "")
+        row["sector"]  = co.get("sector") or row.get("sector", "")
+        row["last_scanned"] = now
+        try:
+            row["scan_count"] = str(int(row.get("scan_count", "0") or 0) + 1)
+        except ValueError:
+            row["scan_count"] = "1"
+        row["last_campaign"] = campaign
+        row["last_findings"] = str(counts.get(k, 0))
+        row.setdefault("first_scanned", now)
+        ledger[k] = row
+
+    dest = Path(path)
+    if dest.parent and not dest.parent.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_LEDGER_FIELDS)
+        w.writeheader()
+        for k in sorted(ledger):
+            w.writerow({fld: ledger[k].get(fld, "") for fld in _LEDGER_FIELDS})
+    tmp.replace(dest)
+    ok(f"Scan ledger updated: {dest}  ({len(ledger)} target(s) tracked)")
+    return str(dest)
+
+def upload_scan_ledger_to_sharepoint(ledger_path: str,
+    enabled: bool,
+    target_folder: str = "") -> bool:
+    """Upload the ledger to a FIXED SharePoint path so it overwrites each run.
+
+    Lives at <folder>/scan_ledger.csv (no timestamp), unlike scan artifacts
+    which go under a per-run timestamped folder.
+    """
+    if not enabled:
+        return False
+    if not Path(ledger_path).exists():
+        return False
+    tenant_id = os.environ.get("SP_TENANT_ID", "").strip()
+    client_id = os.environ.get("SP_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SP_CLIENT_SECRET", "").strip()
+    hostname = os.environ.get("SP_HOSTNAME", "").strip()
+    site_path = os.environ.get("SP_SITE_PATH", "").strip()
+    if not all((tenant_id, client_id, client_secret, hostname, site_path)):
+        return False
+    folder = (target_folder
+              or os.environ.get("SP_TARGET_FOLDER", "").strip()
+              or "NIS2-Scans")
+    remote = f"{folder.strip('/')}/scan_ledger.csv"
+    try:
+        client = _SharePointClient(tenant_id, client_id, client_secret,
+                                   hostname, site_path)
+        client.upload_file(ledger_path, remote)  # PUT /content overwrites
+        ok(f"Scan ledger uploaded → {remote}")
+        return True
+    except PermissionError as e:
+        warn(f"Ledger upload not authorised: {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        warn(f"Ledger upload failed: {e}")
+        return False
+
 def maybe_upload_to_sharepoint(output_dir: str,
     nuclei_output: str,
     enabled: bool,
@@ -6362,6 +6617,14 @@ def parse_args():
                          "per company under by_company/. When set, delivery and "
                          "upload send ONLY the per-company tree, so no delivered "
                          "file spans multiple companies.")
+    sp.add_argument("--scan-ledger", default=SCAN_LEDGER_DEFAULT, metavar="PATH",
+                    help=f"Global ledger of scanned targets, shared across "
+                         f"campaigns (default: {SCAN_LEDGER_DEFAULT}). Targets "
+                         f"already in it are skipped; it is updated every run and "
+                         f"uploaded to a fixed SharePoint path (overwrite).")
+    sp.add_argument("--ignore-ledger", action="store_true",
+                    help="Scan targets even if they are already in the ledger "
+                         "(the ledger is still updated afterwards).")
 
     return p.parse_args()
 
@@ -6766,6 +7029,27 @@ def main():
     if n_urls == 0:
         error("No valid URLs to scan."); sys.exit(1)
 
+    # ── Scan ledger: skip targets already scanned in any prior campaign ──
+    campaign = Path(args.output_dir).name or "default"
+    if not args.ignore_ledger:
+        _ledger = load_scan_ledger(args.scan_ledger)
+        if _ledger:
+            to_scan, skipped = filter_unscanned(final_urls, _ledger)
+            if skipped:
+                info(f"Scan ledger: skipping {len(skipped)} target(s) already "
+                     f"scanned in a previous run.")
+                final_urls = to_scan
+                n_urls = len(final_urls)
+                Path(targets_file).write_text("\n".join(final_urls),
+                                              encoding="utf-8")
+    if n_urls == 0:
+        ok("All candidate targets are already in the scan ledger — nothing new "
+           "to scan. Use --ignore-ledger to force a re-scan.")
+        # Ledger unchanged; still refresh the SharePoint copy for consistency.
+        upload_scan_ledger_to_sharepoint(
+            args.scan_ledger, args.sharepoint_upload, args.sharepoint_folder)
+        sys.exit(0)
+
     def do_dry_run(reason: str = "--dry-run flag set") -> None:
         header(f"DRY RUN  ({reason})")
         cmd = build_nuclei_cmd(targets_file, nuclei_output, args.templates,
@@ -6809,6 +7093,11 @@ def main():
                       args.timeout, args.severity, args.proxy,
                       args.schedule, args.no_retry, already_scanned)
         step_end()
+        _lk_s, _hx_s = load_url_lookup(args.output_dir)
+        update_scan_ledger(args.scan_ledger, final_urls, _lk_s, _hx_s,
+                           campaign, nuclei_output)
+        upload_scan_ledger_to_sharepoint(
+            args.scan_ledger, args.sharepoint_upload, args.sharepoint_folder)
         step_start("Generate summary")
         print_scan_summary(nuclei_output,
                            output_dir=args.output_dir,
@@ -6879,6 +7168,11 @@ def main():
     if rc in (0, 130):
         save_checkpoint(args.output_dir,
                         list(already_scanned | set(final_urls)))
+        _lk, _hx = load_url_lookup(args.output_dir)
+        update_scan_ledger(args.scan_ledger, final_urls, _lk, _hx,
+                           campaign, nuclei_output)
+        upload_scan_ledger_to_sharepoint(
+            args.scan_ledger, args.sharepoint_upload, args.sharepoint_folder)
 
     if rc in (0, 130) and not args.no_retry:
         step_start("Retry failed targets")
