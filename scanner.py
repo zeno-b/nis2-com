@@ -1687,21 +1687,53 @@ def save_dead_targets(output_dir: str, dead_urls: set) -> None:
     except OSError as e:
         warn(f"Could not write dead-target cache: {e}")
 
-def save_checkpoint(output_dir: str, urls) -> None:
-    path = Path(output_dir) / CHECKPOINT_FILE
-    tmp  = path.with_suffix(".tmp")
+def _atomic_write(path, text: str, retries: int = 6) -> None:
+    """Write text to `path` atomically, tolerant of Windows file locks.
+
+    The temp file is fully written AND CLOSED before the rename (Windows cannot
+    rename an open file — the original bug here). The rename is then retried,
+    because Defender/Search Indexer briefly hold the destination and raise
+    WinError 32. If every retry fails, fall back to a direct overwrite so the
+    write is not lost, rather than aborting.
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    # temp file is closed here — safe to rename on Windows
+    last_err = None
+    for i in range(retries):
+        try:
+            os.replace(tmp, path)   # atomic on the same volume
+            return
+        except OSError as e:
+            last_err = e
+            time.sleep(0.2 * (i + 1))   # 0.2s .. 1.2s backoff
+    # Fallback: non-atomic direct overwrite (better than losing the data).
     try:
-        with open(tmp, "w") as f:
-            json.dump({"timestamp": datetime.now().isoformat(timespec="seconds"),
-            "scanned_urls": list(urls)}, f, indent=2)
-            tmp.replace(path)
-            ok(f"Checkpoint saved: {len(urls):,} URLs → {path}")
-    except OSError as e:
-        warn(f"Could not save checkpoint: {e}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    finally:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+    if last_err:
+        # Direct write succeeded; note the degraded path once at debug level.
+        pass
+
+def save_checkpoint(output_dir: str, urls) -> None:
+    path = Path(output_dir) / CHECKPOINT_FILE
+    payload = json.dumps(
+        {"timestamp": datetime.now().isoformat(timespec="seconds"),
+         "scanned_urls": list(urls)}, indent=2)
+    try:
+        _atomic_write(path, payload)
+        ok(f"Checkpoint saved: {len(urls):,} URLs → {path}")
+    except OSError as e:
+        warn(f"Could not save checkpoint: {e}")
 
 def clear_checkpoint(output_dir: str) -> None:
     path = Path(output_dir) / CHECKPOINT_FILE
@@ -1848,7 +1880,8 @@ def resolve_company(host_url: str, lookup: dict,
 
 def save_outputs(nis2_df, websites, denominations, targets_file, manifest_file,
     excludes, resolve_dns, resolve_urls, resume_urls,
-    per_sector_dirs, output_dir, limit=None, dead_urls_cache=None):
+    per_sector_dirs, output_dir, limit=None, dead_urls_cache=None,
+    scan_ledger=None):
 
         nis2_df = nis2_df.copy()
         nis2_df["NIS2_Sector"] = nis2_df["NaceCode"].apply(get_sector_label)
@@ -1893,6 +1926,19 @@ def save_outputs(nis2_df, websites, denominations, targets_file, manifest_file,
             skipped_dead = before_dead - len(urls)
             if skipped_dead:
                 bullet(f"Skipping {skipped_dead:,} known dead target(s) from cache")
+
+        # Scan-ledger filter — BEFORE preflight and --limit, so already-scanned
+        # targets are excluded from selection entirely (not picked then dropped).
+        # This lets --limit select N *new* targets, and lets the caller's
+        # widening loop pull more companies when the current pool is exhausted.
+        if scan_ledger:
+            before_led = len(urls)
+            urls, skipped_led = filter_unscanned(urls, scan_ledger)
+            if skipped_led:
+                header("STEP 5f.6 – SCAN LEDGER FILTER")
+                bullet(f"Skipping {len(skipped_led):,} target(s) already scanned "
+                       "in a previous run (scan ledger)")
+                ok(f"{len(urls):,} unscanned candidate(s) remain")
 
         # Preflight: auto-run when --limit is set so dead targets are dropped
         # before nuclei gets them. Always 3s timeout — fast enough to check
@@ -6304,14 +6350,17 @@ def update_scan_ledger(path: str,
     dest = Path(path)
     if dest.parent and not dest.parent.exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=_LEDGER_FIELDS)
-        w.writeheader()
-        for k in sorted(ledger):
-            w.writerow({fld: ledger[k].get(fld, "") for fld in _LEDGER_FIELDS})
-    tmp.replace(dest)
-    ok(f"Scan ledger updated: {dest}  ({len(ledger)} target(s) tracked)")
+    import io as _io
+    buf = _io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=_LEDGER_FIELDS)
+    w.writeheader()
+    for k in sorted(ledger):
+        w.writerow({fld: ledger[k].get(fld, "") for fld in _LEDGER_FIELDS})
+    try:
+        _atomic_write(dest, buf.getvalue())
+        ok(f"Scan ledger updated: {dest}  ({len(ledger)} target(s) tracked)")
+    except OSError as e:
+        warn(f"Could not write scan ledger {dest}: {e}")
     return str(dest)
 
 def upload_scan_ledger_to_sharepoint(ledger_path: str,
@@ -6584,7 +6633,8 @@ def ci_enrich_from_scan(output_dir: str,
     serp_delay: float,
     no_smtp: bool,
     workers: int,
-    proxies: dict) -> None:
+    proxies: dict,
+    re_enrich: bool = False) -> None:
     """
     After a NIS2 scan, load the manifest + findings and run contact intel
     on the top `contact_limit` companies ordered by finding count.
@@ -6627,48 +6677,52 @@ def ci_enrich_from_scan(output_dir: str,
             warn(f"Could not load contact enrichment JSON '{path}': {e}")
         return found, loaded_orgs
 
-    if json_path.exists():
-        local_done, local_orgs = _load_done_kbos(json_path, include_orgs=True)
-        done_kbos.update(local_done)
-        all_orgs.update(local_orgs)
+    if re_enrich:
+        # Force re-enrichment: do not treat any prior output as "done".
+        bullet("Re-enrich mode : ignoring previously enriched companies")
+    else:
+        if json_path.exists():
+            local_done, local_orgs = _load_done_kbos(json_path, include_orgs=True)
+            done_kbos.update(local_done)
+            all_orgs.update(local_orgs)
 
-    # Also inspect child folders of the current working directory so selection
-    # can skip companies already enriched in sibling campaign folders.
-    skip_dirs = {
-        ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
-        ".venv", "venv", "node_modules",
-    }
-    extra_sources = 0
-    extra_kbos = 0
-    try:
-        local_json_resolved = json_path.resolve()
-    except OSError:
-        local_json_resolved = json_path
-    for root, dirs, files in os.walk(Path.cwd()):
-        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
-        if "contact_enrichment.json" not in files:
-            continue
-        candidate = Path(root) / "contact_enrichment.json"
+        # Also inspect child folders of the current working directory so selection
+        # can skip companies already enriched in sibling campaign folders.
+        skip_dirs = {
+            ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
+            ".venv", "venv", "node_modules",
+        }
+        extra_sources = 0
+        extra_kbos = 0
         try:
-            candidate_resolved = candidate.resolve()
+            local_json_resolved = json_path.resolve()
         except OSError:
-            candidate_resolved = candidate
-        if candidate_resolved == local_json_resolved:
-            continue
-        found, _ = _load_done_kbos(candidate, include_orgs=False)
-        if not found:
-            continue
-        before = len(done_kbos)
-        done_kbos.update(found)
-        added = len(done_kbos) - before
-        if added:
-            extra_sources += 1
-            extra_kbos += added
+            local_json_resolved = json_path
+        for root, dirs, files in os.walk(Path.cwd()):
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+            if "contact_enrichment.json" not in files:
+                continue
+            candidate = Path(root) / "contact_enrichment.json"
+            try:
+                candidate_resolved = candidate.resolve()
+            except OSError:
+                candidate_resolved = candidate
+            if candidate_resolved == local_json_resolved:
+                continue
+            found, _ = _load_done_kbos(candidate, include_orgs=False)
+            if not found:
+                continue
+            before = len(done_kbos)
+            done_kbos.update(found)
+            added = len(done_kbos) - before
+            if added:
+                extra_sources += 1
+                extra_kbos += added
 
     if done_kbos:
         bullet(f"Selection filter : skip {len(done_kbos):,} previously "
                "enriched companies")
-    if extra_sources:
+    if not re_enrich and extra_sources:
         bullet(f"Selection scope  : +{extra_kbos:,} from {extra_sources:,} "
                "child folder enrichment file(s)")
 
@@ -6980,6 +7034,10 @@ def parse_args():
                     help="KBO number for --contact-only  e.g. 0419649912")
     cg.add_argument("--domain",        default="",  metavar="DOMAIN",
                     help="Domain for --contact-only  e.g. bhak.be")
+    cg.add_argument("--re-enrich", action="store_true",
+                    help="Re-enrich companies even if they were enriched in a "
+                         "previous run or another campaign folder (needed to "
+                         "re-run after adding an API key like Hunter).")
     cg.add_argument("--enrich-contacts", action="store_true",
                     help="After the NIS2 scan, run contact intel on the top "
                          "--contact-limit companies (ordered by finding count)")
@@ -7426,6 +7484,8 @@ def main():
                     excludes, args.resolve_dns, args.resolve_urls,
                     already_scanned, args.per_sector_dirs, args.output_dir,
                     limit=args.limit, dead_urls_cache=dead_urls_cache,
+                    scan_ledger=(None if args.ignore_ledger
+                                 else load_scan_ledger(args.scan_ledger)),
                 )
                 info("Breakdown by NIS2 sector:\n")
                 summary_table(sorted(sector_counts.items(), key=lambda x: -x[1]),
@@ -7455,29 +7515,19 @@ def main():
                  f"Widening STEP 1 activity scan window to {next_entity_scan_goal:,} entities.")
             entity_scan_goal = next_entity_scan_goal
 
-    if n_urls == 0:
-        error("No valid URLs to scan."); sys.exit(1)
-
-    # ── Scan ledger: skip targets already scanned in any prior campaign ──
     campaign = Path(args.output_dir).name or "default"
-    if not args.ignore_ledger:
-        _ledger = load_scan_ledger(args.scan_ledger)
-        if _ledger:
-            to_scan, skipped = filter_unscanned(final_urls, _ledger)
-            if skipped:
-                info(f"Scan ledger: skipping {len(skipped)} target(s) already "
-                     f"scanned in a previous run.")
-                final_urls = to_scan
-                n_urls = len(final_urls)
-                Path(targets_file).write_text("\n".join(final_urls),
-                                              encoding="utf-8")
     if n_urls == 0:
-        ok("All candidate targets are already in the scan ledger — nothing new "
-           "to scan. Use --ignore-ledger to force a re-scan.")
-        # Ledger unchanged; still refresh the SharePoint copy for consistency.
-        upload_scan_ledger_to_sharepoint(
-            args.scan_ledger, args.sharepoint_upload, args.sharepoint_folder)
-        sys.exit(0)
+        # Selection already excluded ledger-scanned targets (in save_outputs),
+        # so an empty set here means either nothing matched the sector or every
+        # candidate was already scanned in a prior run.
+        if not args.ignore_ledger and load_scan_ledger(args.scan_ledger):
+            ok("No new targets — every candidate is already in the scan ledger. "
+               "Use --ignore-ledger to force a re-scan.")
+            upload_scan_ledger_to_sharepoint(
+                args.scan_ledger, args.sharepoint_upload, args.sharepoint_folder)
+            sys.exit(0)
+        error("No valid URLs to scan.")
+        sys.exit(1)
 
     def do_dry_run(reason: str = "--dry-run flag set") -> None:
         header(f"DRY RUN  ({reason})")
@@ -7544,7 +7594,8 @@ def main():
                 args.contact_limit, args.hunter_key,
                 args.apollo_key,
                 args.serp_delay, args.no_smtp,
-                args.contact_workers, ci_proxies)
+                args.contact_workers, ci_proxies,
+                re_enrich=args.re_enrich)
         step_start("Per-company findings reports")
         _lookup, _hidx = load_url_lookup(args.output_dir)
         findings_reports = write_company_findings_reports(
@@ -7665,7 +7716,8 @@ def main():
                 args.contact_limit, args.hunter_key,
                 args.apollo_key,
                 args.serp_delay, args.no_smtp,
-                args.contact_workers, ci_proxies)
+                args.contact_workers, ci_proxies,
+                re_enrich=args.re_enrich)
             step_end()
 
     if rc in (0, 130):
