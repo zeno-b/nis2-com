@@ -1,0 +1,50 @@
+id: nis2-tls-hygiene
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NIS2 TLS/certificate hygiene — DETECTION ONLY, 1 request per host.
+# Companion to nis2-hygiene.yaml. Separate file because it uses the ssl
+# protocol; keeping it apart avoids multi-protocol template load issues.
+#
+# NOTE ON DATES: nuclei's ssl block exposes not_after as a formatted string
+# (e.g. "2026-11-02 12:24:33 +0000 UTC"), NOT a unix integer. Comparators like
+# `<` therefore need it converted first. We normalise with:
+#     unix_time = to_unix_time(not_after, "2006-01-02 15:04:05 -0700 MST")
+# (nuclei uses Go's reference-time layout) and compare that integer.
+# Run: nuclei -t nis2-tls.yaml -u https://host -duc
+# ─────────────────────────────────────────────────────────────────────────────
+
+info:
+  name: NIS2 TLS Hygiene (detection-only)
+  author: nis2-scanner
+  severity: info
+  description: TLS certificate and protocol hygiene checks. Observation only.
+  tags: nis2,ssl,tls,detection
+
+ssl:
+  - address: "{{Host}}:443"
+    matchers-condition: or
+    matchers:
+      - type: dsl
+        name: ssl-certificate-expired
+        dsl:
+          - "to_unix_time(not_after, '2006-01-02 15:04:05 -0700 MST') < unixtime()"
+      - type: dsl
+        name: ssl-certificate-expiring-30d
+        dsl:
+          - "to_unix_time(not_after, '2006-01-02 15:04:05 -0700 MST') >= unixtime()"
+          - "to_unix_time(not_after, '2006-01-02 15:04:05 -0700 MST') < (unixtime() + 2592000)"
+        condition: and
+      - type: dsl
+        name: ssl-certificate-expiring-90d
+        dsl:
+          - "to_unix_time(not_after, '2006-01-02 15:04:05 -0700 MST') >= (unixtime() + 2592000)"
+          - "to_unix_time(not_after, '2006-01-02 15:04:05 -0700 MST') < (unixtime() + 7776000)"
+        condition: and
+      - type: dsl
+        name: ssl-self-signed
+        dsl:
+          - "self_signed == true"
+      - type: dsl
+        name: ssl-weak-protocol
+        dsl:
+          - "tls_version == 'tls10' || tls_version == 'tls11'"

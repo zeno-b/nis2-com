@@ -264,7 +264,7 @@ ACTIVITY_FILE           = "activity.csv"
 CONTACT_FILE            = "contact.csv"
 DENOMINATION_FILE       = "denomination.csv"
 OUTPUT_DIR              = "nis2_scan_output"
-DEFAULT_TEMPLATES       = ["t.yaml"]
+DEFAULT_TEMPLATES       = ["templates"]   # run every template in ./templates/
 DEFAULT_RATE            = 150
 DEFAULT_CONCUR          = 25
 DEFAULT_TIMEOUT         = 10
@@ -724,6 +724,34 @@ def resolve_template_path(t: str) -> Optional[Path]:
         return p
     return None
 
+def _expand_templates(paths: List[str]) -> List[str]:
+    """Expand any directory in the template list to the .yaml/.yml files inside.
+
+    This is what makes the scanner run *every* template in a directory by
+    default: pass a folder and each template within it is loaded. Plain files
+    are kept as-is; unresolved paths pass through (the resolver warns later).
+    Recurses into subfolders, de-duplicates, and sorts for stable ordering.
+    """
+    out: List[str] = []
+    seen = set()
+    for p in paths:
+        rp = resolve_template_path(p)
+        if rp and rp.is_dir():
+            files = sorted(set(rp.rglob("*.yaml")) | set(rp.rglob("*.yml")))
+            if not files:
+                warn(f"Template directory '{p}' contains no .yaml/.yml templates.")
+            for f in files:
+                s = str(f.resolve())
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+        else:
+            s = str(rp.resolve()) if rp else p
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
 def parse_template_checks(template_paths: List[str]) -> Dict[str, dict]:
     """
     Parse each template YAML and extract every named matcher.
@@ -738,7 +766,7 @@ def parse_template_checks(template_paths: List[str]) -> Dict[str, dict]:
         return {}
 
     result: Dict[str, dict] = {}
-    for tp in template_paths:
+    for tp in _expand_templates(template_paths):
         fpath = resolve_template_path(tp)
         if fpath is None:
             warn(f"Template '{tp}' not found locally; checks will be "
@@ -1940,7 +1968,7 @@ def build_nuclei_cmd(targets_file, output_file, templates,
     rate, concur, timeout, severity, proxy,
     verbose: bool = False) -> List[str]:
     resolved = []
-    for t in templates:
+    for t in _expand_templates(templates):
         fpath = resolve_template_path(t)
         resolved.append(str(fpath.resolve()) if fpath else t)
 
@@ -6840,7 +6868,8 @@ def parse_args():
 
     ng = p.add_argument_group("Nuclei")
     ng.add_argument("--templates",        action="append", metavar="PATH",
-                    help="May be specified multiple times")
+                    help="Template file OR directory (all templates inside are "
+                         "run). Repeatable. Default: the ./templates/ directory.")
     ng.add_argument("--severity",         default=None, metavar="LIST")
     ng.add_argument("--rate",             type=int, default=None, metavar="N")
     ng.add_argument("--concur",           type=int, default=None, metavar="N")
