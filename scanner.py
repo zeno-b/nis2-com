@@ -4846,6 +4846,25 @@ def ci_query_hunter(domain: str, api_key: str) -> dict:
             params={"domain": domain, "api_key": api_key, "limit": 20},
             timeout=12,
         )
+        # Hunter returns structured errors with a meaningful status code.
+        if r.status_code == 401:
+            warn("[CI-HUNTER] API key rejected (401) — check HUNTER_API_KEY.")
+            return {}
+        if r.status_code == 429:
+            warn("[CI-HUNTER] rate limit / monthly quota reached (429).")
+            return {}
+        if r.status_code == 422:
+            # Invalid/unsupported domain — not fatal, just skip this one.
+            return {}
+        if r.status_code != 200:
+            body = ""
+            try:
+                errs = r.json().get("errors", [])
+                body = "; ".join(e.get("details", "") for e in errs)
+            except Exception:
+                body = r.text[:120]
+            warn(f"[CI-HUNTER] HTTP {r.status_code}: {body}")
+            return {}
         data = r.json().get("data", {})
         info(f"[CI-HUNTER] pattern={data.get('pattern','')} "
         f"| {len(data.get('emails',[]))} emails")
@@ -7154,6 +7173,10 @@ def main():
     args.output_dir   = args.output_dir   or default_output_dir()
     args.templates    = args.templates    or DEFAULT_TEMPLATES
     args.severity     = args.severity     or DEFAULT_SEVERITY
+    # Hunter.io key: CLI flag wins, else HUNTER_API_KEY env var (consistent with
+    # the SP_* / SENDER_* env conventions used elsewhere).
+    args.hunter_key   = args.hunter_key   or os.environ.get("HUNTER_API_KEY", "").strip()
+    args.apollo_key   = args.apollo_key   or os.environ.get("APOLLO_API_KEY", "").strip()
     args.rate         = args.rate         or DEFAULT_RATE
     args.concur       = args.concur       or DEFAULT_CONCUR
     args.timeout      = args.timeout      or DEFAULT_TIMEOUT
