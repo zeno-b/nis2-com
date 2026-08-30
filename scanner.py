@@ -268,7 +268,7 @@ DEFAULT_TEMPLATES       = ["templates"]   # run every template in ./templates/
 DEFAULT_RATE            = 150
 DEFAULT_CONCUR          = 25
 DEFAULT_TIMEOUT         = 10
-DEFAULT_SEVERITY        = "low,medium,high,critical"
+DEFAULT_SEVERITY        = "info,low,medium,high,critical"   # include info: hygiene templates are info-level
 DEFAULT_CONTACT_WORKERS = 4
 CHECKPOINT_FILE         = "checkpoint.json"
 RETRY_FILE              = "retry_targets.txt"
@@ -751,6 +751,51 @@ def _expand_templates(paths: List[str]) -> List[str]:
                 seen.add(s)
                 out.append(s)
     return out
+
+def _preflight_templates(args, template_checks: Dict[str, dict]) -> None:
+    """Guard the two failure modes that produce a silent zero-findings scan:
+
+    1. No runnable template resolves (e.g. the templates dir is missing or
+       empty) — nuclei would abort with 'no templates provided'. We detect this
+       BEFORE scanning and exit with actionable guidance instead.
+    2. The --severity filter excludes every loaded template (these hygiene
+       templates are severity:info; a filter of low,medium,high,critical drops
+       them). We widen the filter and warn, rather than scanning to zero.
+    """
+    files = _expand_templates(args.templates)
+    real = [f for f in files if Path(f).is_file()]
+    if not real:
+        default_dir = Path(__file__).parent / "templates"
+        error(f"No nuclei templates found (looked in: {', '.join(args.templates)}).")
+        bullet("Create a templates folder next to the script and add .yaml "
+               "templates:")
+        bullet(f"    {default_dir}")
+        bullet("Then re-run, or pass --templates <file-or-dir> explicitly.")
+        if args.templates == DEFAULT_TEMPLATES and not default_dir.exists():
+            try:
+                default_dir.mkdir(parents=True, exist_ok=True)
+                bullet(f"Created empty {default_dir} — drop your .yaml files "
+                       "there and re-run.")
+            except OSError:
+                pass
+        sys.exit(1)
+
+    # Report how many templates will actually run (not the dir arg).
+    ok(f"{len(real)} template file(s) will run: "
+       + ", ".join(Path(f).name for f in real[:8])
+       + (" …" if len(real) > 8 else ""))
+
+    # Severity reconciliation.
+    tmpl_sevs = {(c.get("severity") or "").lower()
+                 for v in template_checks.values()
+                 for c in v.get("checks", []) if c.get("severity")}
+    filt = {s.strip().lower() for s in (args.severity or "").split(",") if s.strip()}
+    if tmpl_sevs and filt and not (tmpl_sevs & filt):
+        warn(f"Severity filter {sorted(filt)} excludes every loaded template "
+             f"(severities present: {sorted(tmpl_sevs)}). Widening it — "
+             f"otherwise the scan returns zero findings.")
+        args.severity = ",".join(sorted(filt | tmpl_sevs))
+        bullet(f"Effective severity: {args.severity}")
 
 def parse_template_checks(template_paths: List[str]) -> Dict[str, dict]:
     """
@@ -7139,6 +7184,7 @@ def main():
     total_checks    = sum(len(v["checks"]) for v in template_checks.values())
     ok(f"{len(template_checks)} template(s)  |  "
        f"{total_checks} named check(s) defined")
+    _preflight_templates(args, template_checks)
     step_end()
 
     if args.summary_only:
