@@ -1,0 +1,286 @@
+id: nis2-web-hygiene
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NIS2 web-security hygiene — DETECTION ONLY, max 5 requests per host.
+#
+# This template only OBSERVES what a host returns: response headers, cookie
+# flags, CORS behaviour, information disclosure, technology fingerprints, a few
+# well-known file exposures, and the TLS certificate. It sends NO exploit
+# payloads — no injection, no traversal to read files, no auth bypass, no
+# fuzzing. It confirms that a misconfiguration EXISTS; it never goes further.
+#
+# Legality: active scanning of systems you do not own is lawful in Belgium only
+# under authorised testing, or as good-faith coordinated disclosure under the
+# CVDP framework (art. 550bis §5 Sw.) — which requires prompt reporting to the
+# CCB and to the organisation, minimal testing, and no public disclosure. Use
+# it accordingly.
+#
+# Request budget (5):
+#   1. GET /                       — headers, cookies, CORS, disclosure, tech, body
+#   2. GET /.well-known/security.txt — RFC 9116 presence / absence
+#   3. GET /robots.txt             — sensitive paths disclosed in robots
+#   4. GET /.git/config            — exposed version-control metadata
+#   5. TLS handshake ({{Host}}:443) — certificate & protocol hygiene
+#
+# Each matcher is independently named, so Nuclei emits one finding per issue
+# (the matcher-name), which downstream tooling reads directly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+info:
+  name: NIS2 Web Security Hygiene (detection-only)
+  author: nis2-scanner
+  severity: info
+  description: >
+    Non-intrusive detection of common web-security misconfigurations relevant to
+    NIS2 posture: missing/weak security headers, insecure cookies, permissive
+    CORS, information disclosure, exposed well-known files, and TLS certificate
+    hygiene. Observation only; no exploitation.
+  tags: nis2,misconfig,headers,tls,exposure,detection
+  classification:
+    cwe-id:
+      - CWE-16    # Configuration
+      - CWE-693   # Protection Mechanism Failure
+      - CWE-200   # Information Exposure
+
+http:
+  # ── Request 1: root document — the bulk of the checks ──────────────────────
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    headers:
+      # A benign test Origin lets us observe CORS reflection without any payload.
+      Origin: "https://nis2-cors-probe.invalid"
+    host-redirects: true
+    max-redirects: 2
+    matchers-condition: or
+    matchers:
+      # — Security headers: absence —
+      - type: dsl
+        name: missing-hsts
+        dsl:
+          - "!contains(tolower(all_headers), 'strict-transport-security')"
+      - type: dsl
+        name: hsts-missing-includesubdomains
+        dsl:
+          - "contains(tolower(all_headers), 'strict-transport-security') && !contains(tolower(all_headers), 'includesubdomains')"
+      - type: regex
+        name: weak-hsts-max-age
+        part: header
+        regex:
+          # max-age below ~1 year (any value with fewer than 8 digits)
+          - "(?i)strict-transport-security:[^\\r\\n]*max-age=[0-9]{1,7}(?:[^0-9]|$)"
+      - type: dsl
+        name: missing-csp
+        dsl:
+          - "!contains(tolower(all_headers), 'content-security-policy')"
+      - type: word
+        name: weak-csp-unsafe-inline
+        part: header
+        words:
+          - "unsafe-inline"
+      - type: word
+        name: weak-csp-unsafe-eval
+        part: header
+        words:
+          - "unsafe-eval"
+      - type: dsl
+        name: missing-x-frame-options
+        dsl:
+          - "!contains(tolower(all_headers), 'x-frame-options') && !contains(tolower(all_headers), 'frame-ancestors')"
+      - type: dsl
+        name: missing-x-content-type-options
+        dsl:
+          - "!contains(tolower(all_headers), 'x-content-type-options')"
+      - type: dsl
+        name: missing-referrer-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'referrer-policy')"
+      - type: dsl
+        name: missing-permissions-policy
+        dsl:
+          - "!contains(tolower(all_headers), 'permissions-policy')"
+      - type: dsl
+        name: missing-coop
+        dsl:
+          - "!contains(tolower(all_headers), 'cross-origin-opener-policy')"
+      - type: dsl
+        name: missing-corp
+        dsl:
+          - "!contains(tolower(all_headers), 'cross-origin-resource-policy')"
+
+      # — Cookie flags —
+      - type: dsl
+        name: cookie-missing-secure
+        dsl:
+          - "contains(tolower(all_headers), 'set-cookie') && !contains(tolower(all_headers), 'secure')"
+      - type: dsl
+        name: cookie-missing-httponly
+        dsl:
+          - "contains(tolower(all_headers), 'set-cookie') && !contains(tolower(all_headers), 'httponly')"
+      - type: dsl
+        name: cookie-missing-samesite
+        dsl:
+          - "contains(tolower(all_headers), 'set-cookie') && !contains(tolower(all_headers), 'samesite')"
+
+      # — CORS —
+      - type: word
+        name: cors-wildcard-origin
+        part: header
+        words:
+          - "access-control-allow-origin: *"
+      - type: word
+        name: cors-reflects-origin
+        part: header
+        words:
+          - "access-control-allow-origin: https://nis2-cors-probe.invalid"
+
+      # — Information / version disclosure —
+      - type: regex
+        name: server-version-disclosure
+        part: header
+        regex:
+          - "(?i)server:\\s*\\S+/[0-9]+\\.[0-9]"
+      - type: dsl
+        name: x-powered-by-disclosure
+        dsl:
+          - "contains(tolower(all_headers), 'x-powered-by')"
+      - type: dsl
+        name: aspnet-version-disclosure
+        dsl:
+          - "contains(tolower(all_headers), 'x-aspnet-version') || contains(tolower(all_headers), 'x-aspnetmvc-version')"
+      - type: regex
+        name: internal-ip-in-headers
+        part: header
+        regex:
+          - "(?i)(10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|172\\.(1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3})"
+
+      # — Technology fingerprint (body) —
+      - type: regex
+        name: generator-meta-disclosure
+        part: body
+        regex:
+          - "(?i)<meta[^>]+name=[\"']generator[\"'][^>]+content="
+      - type: word
+        name: tech-wordpress
+        part: body
+        words:
+          - "/wp-content/"
+          - "/wp-includes/"
+        condition: or
+      - type: word
+        name: tech-drupal
+        part: body
+        words:
+          - "Drupal.settings"
+          - "/sites/default/files"
+        condition: or
+      - type: word
+        name: tech-joomla
+        part: body
+        words:
+          - "/media/jui/"
+          - "com_content"
+        condition: or
+
+      # — Content integrity (body) —
+      - type: regex
+        name: mixed-content-http-resource
+        part: body
+        regex:
+          - "(?i)(src|href)=[\"']http://"
+      - type: regex
+        name: stack-trace-disclosure
+        part: body
+        regex:
+          - "(?i)(stack trace:|traceback \\(most recent call last\\)|at [a-z0-9_.]+\\([A-Za-z0-9_]+\\.(java|cs|php|py):[0-9]+\\))"
+      - type: word
+        name: debug-mode-indicators
+        part: body
+        words:
+          - "Whoops, looks like something went wrong"
+          - "Werkzeug Debugger"
+          - "DEBUG = True"
+          - "Symfony\\Component\\Debug"
+        condition: or
+
+  # ── Request 2: RFC 9116 security.txt — presence / absence ──────────────────
+  - method: GET
+    path:
+      - "{{BaseURL}}/.well-known/security.txt"
+    matchers-condition: or
+    matchers:
+      - type: dsl
+        name: security-txt-present
+        dsl:
+          - "status_code == 200 && contains(tolower(body), 'contact:')"
+      - type: dsl
+        name: missing-security-txt
+        dsl:
+          - "status_code != 200"
+
+  # ── Request 3: robots.txt — sensitive paths disclosed ──────────────────────
+  - method: GET
+    path:
+      - "{{BaseURL}}/robots.txt"
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        words:
+          - "text/plain"
+      - type: regex
+        name: sensitive-paths-disclosed
+        part: body
+        regex:
+          - "(?i)disallow:\\s*/(admin|backup|backups|config|api|private|internal|\\.git|db|sql|old|tmp|test|staging)"
+
+  # ── Request 4: exposed version-control metadata (presence only) ────────────
+  - method: GET
+    path:
+      - "{{BaseURL}}/.git/config"
+    matchers-condition: and
+    matchers:
+      - type: word
+        name: exposed-git-config
+        part: body
+        words:
+          - "[core]"
+          - "repositoryformatversion"
+        condition: and
+      - type: word
+        part: header
+        negative: true
+        words:
+          - "text/html"
+
+# ── Request 5: TLS certificate & protocol hygiene (single handshake) ─────────
+ssl:
+  - address: "{{Host}}:443"
+    matchers-condition: or
+    matchers:
+      - type: dsl
+        name: ssl-certificate-expired
+        dsl:
+          - "not_after < unixtime()"
+      - type: dsl
+        name: ssl-certificate-expiring-30d
+        dsl:
+          - "not_after >= unixtime() && not_after < (unixtime() + 2592000)"
+      - type: dsl
+        name: ssl-certificate-expiring-90d
+        dsl:
+          - "not_after >= (unixtime() + 2592000) && not_after < (unixtime() + 7776000)"
+      - type: dsl
+        name: ssl-self-signed
+        dsl:
+          - "self_signed == true"
+      - type: dsl
+        name: ssl-weak-protocol
+        dsl:
+          - "tls_version == 'tls10' || tls_version == 'tls11'"
+      - type: dsl
+        name: ssl-hostname-mismatch
+        dsl:
+          - "Host != subject_cn && !contains(subject_an, Host)"
+
+# End of template.
