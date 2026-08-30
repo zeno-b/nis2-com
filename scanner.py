@@ -62,6 +62,7 @@ import re
 
 import socket
 import shutil
+import textwrap
 import subprocess
 import sys
 import threading
@@ -270,15 +271,47 @@ DEFAULT_CONCUR          = 25
 DEFAULT_TIMEOUT         = 10
 DEFAULT_SEVERITY        = "info,low,medium,high,critical"   # include info: hygiene templates are info-level
 DEFAULT_CONTACT_WORKERS = 4
+
+# ══════════════════════════════════════════════════════════════════════════
+# OUTPUT FILE & DIRECTORY NAMES  — edit any value here to rename what the
+# scanner writes. These are the single source of truth; nothing below
+# hard-codes these names. Paths are relative to each run's --output-dir
+# unless noted as campaign-independent (written in the working directory).
+# ══════════════════════════════════════════════════════════════════════════
+# Per-run working files
+TARGETS_FILE            = "targets.txt"
+NUCLEI_RESULTS_FILE     = "nuclei_results.json"
+MANIFEST_FILE           = "nis2_companies_manifest.csv"
 CHECKPOINT_FILE         = "checkpoint.json"
 RETRY_FILE              = "retry_targets.txt"
 DEAD_TARGETS_FILE       = "dead_targets.txt"
 URL_LOOKUP_FILE         = "url_company_lookup.json"
+TIMINGS_FILE            = "step_timings.json"
+# Reports / exports
 COVERAGE_CSV            = "full_coverage_report.csv"
+COVERAGE_XLSX           = "full_coverage_report.xlsx"
 SCAN_RESULTS_JSON       = "scan_results.json"
 SCAN_RESULTS_CSV        = "scan_results.csv"
 SCAN_RESULTS_HTML       = "scan_results.html"
-TIMINGS_FILE            = "step_timings.json"
+REPORT_HTML_ALT         = "nis2_report.html"
+SUMMARY_BRIEF_HTML      = "nis2_summary_brief.html"
+# Contact enrichment
+CONTACT_ENRICHMENT_JSON = "contact_enrichment.json"
+CONTACT_ENRICHMENT_CSV  = "contact_enrichment.csv"
+COMBINED_CONTACTS_JSON  = "combined_contacts.json"
+COMBINED_CONTACTS_CSV   = "combined_contacts.csv"
+# Per-company output directories
+BY_COMPANY_DIR          = "by_company"
+NO_FINDINGS_DIR         = "no_findings"
+# Per-company report filename prefixes (company slug is appended)
+CCB_REPORT_PREFIX       = "ccb_disclosure_"
+FINDINGS_REPORT_PREFIX  = "findings_"
+INTRO_EMAIL_PREFIX      = "intro_"
+# Campaign-independent state (written in the current working directory)
+SCAN_LEDGER_DEFAULT     = "scan_ledger.csv"
+HUNTER_CACHE_FILE       = "hunter_cache.json"
+# ══════════════════════════════════════════════════════════════════════════
+
 TARGETS_MAX_AGE_MINUTES = 60
 DNS_WORKERS             = 100
 DNS_TIMEOUT             = 3
@@ -1333,9 +1366,6 @@ def load_websites_for_entities(
        f"(rows scanned: {rows_read:,}  |  {elapsed:.1f}s)")
     return websites
 
-def load_websites_all(contact_file: str) -> dict:
-    """Backwards-compatible wrapper: load all WEB entries."""
-    return load_websites_for_entities(contact_file)
 
 def load_denominations(denomination_file: str,
     entity_numbers) -> dict:
@@ -1628,7 +1658,7 @@ def load_subdir_targets(output_dir: str) -> set:
         ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
         ".venv", "venv", "node_modules",
     }
-    root_targets = root / "targets.txt"
+    root_targets = root / TARGETS_FILE
     try:
         root_targets_resolved = root_targets.resolve()
     except OSError:
@@ -1638,9 +1668,9 @@ def load_subdir_targets(output_dir: str) -> set:
     urls: set = set()
     for cur_root, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
-        if "targets.txt" not in files:
+        if TARGETS_FILE not in files:
             continue
-        candidate = Path(cur_root) / "targets.txt"
+        candidate = Path(cur_root) / TARGETS_FILE
         try:
             candidate_resolved = candidate.resolve()
         except OSError:
@@ -2006,7 +2036,7 @@ def save_outputs(nis2_df, websites, denominations, targets_file, manifest_file,
                 s_dir = Path(output_dir) / safe
                 try:
                     s_dir.mkdir(parents=True, exist_ok=True)
-                    s_file = s_dir / "targets.txt"
+                    s_file = s_dir / TARGETS_FILE
                     with open(s_file, "w") as f:
                         f.write("\n".join(s_urls))
                     sector_files[sector] = str(s_file)
@@ -2416,7 +2446,7 @@ def save_coverage_xlsx(matrix: dict, all_checks: List[dict],
                 get_column_letter(col[0].column)
             ].width = min(max_len + 2, 60)
 
-    path = Path(output_dir) / COVERAGE_CSV.replace(".csv", ".xlsx")
+    path = Path(output_dir) / COVERAGE_XLSX
     try:
         wb.save(path)
         ok(f"Coverage XLSX: {path}")
@@ -2594,7 +2624,7 @@ def write_no_findings_folder(scanned_hosts: List[str],
     if not clean:
         return []
 
-    folder = Path(output_dir) / "no_findings"
+    folder = Path(output_dir) / NO_FINDINGS_DIR
     folder.mkdir(parents=True, exist_ok=True)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     written: List[str] = []
@@ -2648,6 +2678,7 @@ def write_ccb_disclosure_reports(nuclei_output: str,
     researcher = researcher or _sender_config()
     functional_by_domain = _load_functional_mailboxes(output_dir)
     security_by_domain = _load_security_contacts(output_dir)
+    contacts_by_domain = _load_org_contacts(output_dir)
 
     companies: Dict[str, dict] = {}
     for finding in stream_findings(results_path):
@@ -2662,7 +2693,7 @@ def write_ccb_disclosure_reports(nuclei_output: str,
     if not companies:
         return []
 
-    report_root = Path(output_dir) / "by_company"
+    report_root = Path(output_dir) / BY_COMPANY_DIR
     report_root.mkdir(parents=True, exist_ok=True)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     written: List[str] = []
@@ -2748,13 +2779,58 @@ def write_ccb_disclosure_reports(nuclei_output: str,
                 lines.append(f"[{i}] {title}   ({f.get('severity', 'unknown').upper()})")
                 if f.get("matched_at"):
                     lines.append(f"    Locatie / Location : {f['matched_at']}")
+                # Plain-language explanation of what the issue is and why it matters.
+                explanation = f.get("executive_summary") or f.get("description") or ""
+                if explanation:
+                    for wrapped in textwrap.wrap(f"Wat / What: {explanation}",
+                                                 width=88,
+                                                 subsequent_indent="        "):
+                        lines.append(f"    {wrapped}")
                 if f.get("evidence"):
                     lines.append(f"    Bewijs / Evidence  : {f['evidence']}")
                 if f.get("risk"):
-                    lines.append(f"    Risico / Risk      : {f['risk']}")
+                    for wrapped in textwrap.wrap(f"Risico / Risk: {f['risk']}",
+                                                 width=88,
+                                                 subsequent_indent="        "):
+                        lines.append(f"    {wrapped}")
                 if f.get("remediation"):
-                    lines.append(f"    Herstel / Remediation : {f['remediation']}")
+                    for wrapped in textwrap.wrap(
+                            f"Herstel / Remediation: {f['remediation']}",
+                            width=88, subsequent_indent="        "):
+                        lines.append(f"    {wrapped}")
                 lines.append("")
+
+        # Contact enrichment (Hunter.io) for this organisation.
+        org_contacts = contacts_by_domain.get(domain, [])
+        if org_contacts:
+            lines.append("-" * 74)
+            lines.append("CONTACTPERSONEN / CONTACTS  (bron / source: Hunter.io)")
+            lines.append("-" * 74)
+            lines.append("Mogelijke contactpersonen binnen de organisatie, ter "
+                         "aanvulling op het")
+            lines.append("beveiligingsadres hierboven. / Possible contacts within "
+                         "the organisation,")
+            lines.append("supplementary to the security address above.")
+            lines.append("")
+            for c in org_contacts:
+                nm = c.get("name", "").strip()
+                if not nm:
+                    continue
+                role = c.get("role") or c.get("seniority") or ""
+                line = f"  • {nm}" + (f"  ({role})" if role else "")
+                lines.append(line)
+                sub = []
+                if c.get("email"):
+                    status = c.get("email_status", "")
+                    sub.append(f"{c['email']}"
+                               + (f" [{status}]" if status else ""))
+                if c.get("phone"):
+                    sub.append(c["phone"])
+                if c.get("linkedin_url"):
+                    sub.append(c["linkedin_url"])
+                for s in sub:
+                    lines.append(f"      {s}")
+            lines.append("")
 
         lines.append("-" * 74)
         lines.append("VOLGENDE STAPPEN / NEXT STEPS")
@@ -2776,10 +2852,10 @@ def write_ccb_disclosure_reports(nuclei_output: str,
         slug = _slug(name)
         company_dir = report_root / slug
         company_dir.mkdir(parents=True, exist_ok=True)
-        fpath = company_dir / f"ccb_disclosure_{slug}.txt"
+        fpath = company_dir / f"{CCB_REPORT_PREFIX}{slug}.txt"
         n = 2
         while fpath.exists():
-            fpath = company_dir / f"ccb_disclosure_{slug}_{n}.txt"
+            fpath = company_dir / f"{CCB_REPORT_PREFIX}{slug}_{n}.txt"
             n += 1
         fpath.write_text("\n".join(lines), encoding="utf-8")
         written.append(str(fpath))
@@ -2818,7 +2894,7 @@ def write_company_findings_reports(nuclei_output: str,
     if not companies:
         return []
 
-    report_root = Path(output_dir) / "by_company"
+    report_root = Path(output_dir) / BY_COMPANY_DIR
     report_root.mkdir(parents=True, exist_ok=True)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     written: List[str] = []
@@ -2884,11 +2960,11 @@ def write_company_findings_reports(nuclei_output: str,
         slug = _slug(name)
         company_dir = report_root / slug
         company_dir.mkdir(parents=True, exist_ok=True)
-        fpath = company_dir / f"findings_{slug}.txt"
+        fpath = company_dir / f"{FINDINGS_REPORT_PREFIX}{slug}.txt"
         # Avoid collisions when two companies slugify to the same name.
         n = 2
         while fpath.exists():
-            fpath = company_dir / f"findings_{slug}_{n}.txt"
+            fpath = company_dir / f"{FINDINGS_REPORT_PREFIX}{slug}_{n}.txt"
             n += 1
         fpath.write_text("\n".join(lines), encoding="utf-8")
         written.append(str(fpath))
@@ -2957,7 +3033,7 @@ def _load_functional_mailboxes(output_dir: str) -> Dict[str, List[str]]:
     Returns an empty map if enrichment hasn't run, so intro emails still work.
     """
     out: Dict[str, List[str]] = {}
-    p = Path(output_dir) / "contact_enrichment.json"
+    p = Path(output_dir) / CONTACT_ENRICHMENT_JSON
     if not p.exists():
         return out
     try:
@@ -2976,7 +3052,7 @@ def _load_functional_mailboxes(output_dir: str) -> Dict[str, List[str]]:
 def _load_security_contacts(output_dir: str) -> Dict[str, str]:
     """domain -> declared/best security contact, from contact_enrichment.json."""
     out: Dict[str, str] = {}
-    p = Path(output_dir) / "contact_enrichment.json"
+    p = Path(output_dir) / CONTACT_ENRICHMENT_JSON
     if not p.exists():
         return out
     try:
@@ -2990,6 +3066,26 @@ def _load_security_contacts(output_dir: str) -> Dict[str, str]:
         sc = str(org.get("security_contact", "")).strip()
         if dom and sc:
             out[dom] = sc
+    return out
+
+def _load_org_contacts(output_dir: str) -> Dict[str, list]:
+    """domain -> list of Hunter-found contacts, from contact_enrichment.json."""
+    out: Dict[str, list] = {}
+    p = Path(output_dir) / CONTACT_ENRICHMENT_JSON
+    if not p.exists():
+        return out
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    for entry in (data if isinstance(data, list) else [data]):
+        if not isinstance(entry, dict):
+            continue
+        org = entry.get("org", entry)
+        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
+        contacts = org.get("contacts") or []
+        if dom and contacts:
+            out[dom] = contacts
     return out
 
 def write_intro_emails(scanned_hosts: List[str],
@@ -3008,7 +3104,7 @@ def write_intro_emails(scanned_hosts: List[str],
     if not companies:
         return []
 
-    report_root = Path(output_dir) / "by_company"
+    report_root = Path(output_dir) / BY_COMPANY_DIR
     report_root.mkdir(parents=True, exist_ok=True)
     written: List[str] = []
     for key, data in companies.items():
@@ -3028,10 +3124,10 @@ def write_intro_emails(scanned_hosts: List[str],
         slug = _slug(name)
         company_dir = report_root / slug
         company_dir.mkdir(parents=True, exist_ok=True)
-        fpath = company_dir / f"intro_{slug}.txt"
+        fpath = company_dir / f"{INTRO_EMAIL_PREFIX}{slug}.txt"
         n = 2
         while fpath.exists():
-            fpath = company_dir / f"intro_{slug}_{n}.txt"
+            fpath = company_dir / f"{INTRO_EMAIL_PREFIX}{slug}_{n}.txt"
             n += 1
         fpath.write_text(body, encoding="utf-8")
         written.append(str(fpath))
@@ -3144,12 +3240,12 @@ def split_outputs_by_company(output_dir: str,
     _unassigned/ folder rather than being dropped.
     """
     out = Path(output_dir)
-    root = out / "by_company"
+    root = out / BY_COMPANY_DIR
     root.mkdir(parents=True, exist_ok=True)
     written: List[str] = []
 
-    csv_files = [SCAN_RESULTS_CSV, COVERAGE_CSV, "contact_enrichment.csv",
-                 "combined_contacts.csv", "nis2_companies_manifest.csv"]
+    csv_files = [SCAN_RESULTS_CSV, COVERAGE_CSV, CONTACT_ENRICHMENT_CSV,
+                 COMBINED_CONTACTS_CSV, MANIFEST_FILE]
     for name in csv_files:
         p = out / name
         if p.exists() and p.stat().st_size > 0:
@@ -3158,14 +3254,14 @@ def split_outputs_by_company(output_dir: str,
             except Exception as e:  # noqa: BLE001
                 warn(f"split {name}: {e}")
 
-    xlsx_p = out / COVERAGE_CSV.replace(".csv", ".xlsx")
+    xlsx_p = out / COVERAGE_XLSX
     if xlsx_p.exists() and xlsx_p.stat().st_size > 0:
         try:
             written += _split_xlsx(xlsx_p, root, lookup, hostname_index)
         except Exception as e:  # noqa: BLE001
             warn(f"split {xlsx_p.name}: {e}")
 
-    for name in ("contact_enrichment.json", "combined_contacts.json"):
+    for name in (CONTACT_ENRICHMENT_JSON, COMBINED_CONTACTS_JSON):
         p = out / name
         if p.exists() and p.stat().st_size > 0:
             try:
@@ -3684,7 +3780,7 @@ def print_scan_summary(nuclei_output: str,
         template_checks = parse_template_checks(template_paths or [])
 
     if scanned_hosts is None:
-        tf = Path(output_dir or ".") / "targets.txt"
+        tf = Path(output_dir or ".") / TARGETS_FILE
         if tf.exists():
             scanned_hosts = load_targets_from_file(str(tf))
         else:
@@ -3953,7 +4049,6 @@ def print_scan_summary(nuclei_output: str,
 
 try:
     import requests as _requests
-    from bs4 import BeautifulSoup as _BS
     from requests.adapters import HTTPAdapter as _HTTPAdapter
     try:
         from urllib3.util.retry import Retry as _Retry
@@ -3973,7 +4068,6 @@ except ImportError:
 
 import smtplib as _smtplib
 from dataclasses import dataclass as _dataclass, field as _field
-from urllib.parse import quote_plus as _qp
 
 # ── Constants ─────────────────────────────────────────────────────────
 
@@ -3981,7 +4075,6 @@ _CI_KBO_URL      = ("https://kbopub.economie.fgov.be/kbopub/"
 "toonondernemingps.html")
 _CI_STAATSBLAD   = "https://www.ejustice.just.fgov.be/cgi_tsv/list.pl"
 _CI_HUNTER_API   = "https://api.hunter.io/v2"
-_CI_APOLLO_API   = "https://api.apollo.io/v1"
 _CI_EMAILFMT_URL = "https://www.email-format.com/d"
 _CI_INFOBEL_URL  = "https://www.infobel.com/fr/belgium"
 
@@ -4150,802 +4243,64 @@ def _ci_get(url: str, proxies: dict, delay: float,
     except Exception:
         return None
 
-def _ci_soup(r) -> object:
-    return _BS(r.text, "html.parser")
 
     # ── Text helpers ──────────────────────────────────────────────────────
 
-def _ci_norm_phone(raw: str) -> str:
-    digits = re.sub(r"[^\d]", "", raw)
-    if digits.startswith("32") and len(digits) >= 10:
-        return "+" + digits
-    if digits.startswith("0") and len(digits) >= 9:
-        return "+32" + digits[1:]
-    return digits
 
-def _ci_emails_from(text: str, domain: str = "") -> List[str]:
-    found = {
-        e.lower()
-        for e in re.findall(r"[\w.+%-]{2,}@[\w.-]+\.[a-zA-Z]{2,}", text or "")
-    }
-    if domain:
-        domain_l = domain.lower().strip()
-        found = {e for e in found if e.split("@", 1)[-1].endswith(domain_l)}
-    return sorted(found)
 
-def _ci_phones_from(text: str) -> List[str]:
-    """Extract Belgian phone numbers from plain text."""
-    raw = re.findall(r"(?:\+32|0032|0)[\s./-]?\d(?:[\s./-]?\d){7,10}", text or "")
-    results: List[str] = []
-    seen = set()
-    for p in raw:
-        normed = _ci_norm_phone(p)
-        digits = re.sub(r"\D", "", normed)
-        if 9 <= len(digits) <= 12 and normed not in seen:
-            seen.add(normed)
-            results.append(normed)
-    return results
 
-def _ci_phones_from_soup(soup, kbo_digits: str = "") -> List[str]:
-    """
-    Extract phones from HTML structure — 3 layers:
-    1. <a href="tel:..."> links  (most reliable on modern sites)
-    2. JSON-LD telephone field   (Organization / LocalBusiness schema)
-    3. Plain-text regex fallback
-    Filters out any number whose digits match kbo_digits.
-    """
-    found: List[str] = []
 
-    def _accept(normed: str) -> bool:
-        d = re.sub(r"\D", "", normed)
-        return (9 <= len(d) <= 12
-                and d != kbo_digits
-                and normed not in found)
-
-    # 1. tel: links
-    for a in soup.find_all("a", href=re.compile(r"^tel:", re.I)):
-        raw = a["href"][4:].strip()
-        n   = _ci_norm_phone(raw)
-        if _accept(n):
-            found.append(n)
-
-    # 2. JSON-LD structured data
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "{}")
-            if isinstance(data, list):
-                data = next((d for d in data if d.get("@type") in (
-                    "Organization", "LocalBusiness",
-                    "MedicalOrganization", "Hospital", "GovernmentOrganization"
-                )), {})
-            for phone in ([data.get("telephone")] +
-                          data.get("contactPoint", [{}]) if isinstance(
-                              data.get("contactPoint"), list) else []):
-                if isinstance(phone, dict):
-                    phone = phone.get("telephone", "")
-                if phone:
-                    n = _ci_norm_phone(str(phone))
-                    if _accept(n):
-                        found.append(n)
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            pass
-
-    # 3. Plain-text fallback
-    for p in _ci_phones_from(soup.get_text(" ", strip=True)):
-        if _accept(p):
-            found.append(p)
-
-    return found
-
-def _ci_infer_email(first: str, last: str, domain: str, pattern: str) -> str:
-    f = re.sub(r"[^a-z]", "", first.lower())
-    l = re.sub(r"[^a-z]", "", last.lower())
-    fi = f[0] if f else ""
-    if "v.naam" in pattern:
-        return f"{fi}.{l}@{domain}"
-    if pattern.startswith("voornaam@"):
-        return f"{f}@{domain}"
-    return f"{f}.{l}@{domain}"   # default: voornaam.naam
 
 def _ci_name_key(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip().lower())
 
     # ── 1. KBO profile fetch ──────────────────────────────────────────────
 
-def ci_fetch_kbo(kbo: str, proxies: dict, delay: float) -> dict:
-    """Fetch KBO page, return mandataries + org contact info."""
-    clean = re.sub(r"[^0-9]", "", kbo)
-    r     = _ci_get(_CI_KBO_URL, proxies, delay,
-    params={"ondernemingsnummer": clean})
-    out   = {"kbo": kbo, "name": "", "phone": "", "email": "",
-    "address": "", "domain": "", "mandataries": []}
-    if not r:
-        return out
-
-    soup = _ci_soup(r)
-    board_roles = {
-        "Bestuurder", "Voorzitter", "Gedelegeerd bestuurder",
-        "Ondervoorzitter", "Secretaris", "Penningmeester",
-        "Zaakvoerder", "Administrateur", "Directeur",
-    }
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if not cells:
-            continue
-        c0 = cells[0].get_text(" ", strip=True)
-        c1 = cells[1].get_text(" ", strip=True) if len(cells) > 1 else ""
-        c2 = cells[2].get_text(" ", strip=True) if len(cells) > 2 else ""
-
-        if "Naam:" in c0 and not out["name"]:
-            # KBO appends " Naam in het Nederlands, sinds DD maand YYYY" —
-            # strip everything from " Naam " onward to get the bare company name.
-            raw_name = c1
-            raw_name = re.sub(
-                r"\s+Naam\s+in\s+het\s+\w+.*$", "", raw_name,
-                flags=re.IGNORECASE).strip()
-            raw_name = re.sub(
-                r"\s*,\s*sinds\s+\d.*$", "", raw_name,
-                flags=re.IGNORECASE).strip()
-            out["name"] = raw_name
-        if "Telefoonnummer" in c0:
-            kbo_digits = re.sub(r"\D", "", kbo)
-            # Try tel: links in this row first (more reliable)
-            tel_links = row.find_all("a", href=re.compile(r"^tel:", re.I))
-            if tel_links:
-                raw    = tel_links[0]["href"][4:].strip()
-                normed = _ci_norm_phone(raw)
-                digits = re.sub(r"\D", "", normed)
-                if 9 <= len(digits) <= 12 and digits != kbo_digits:
-                    out["phone"] = normed
-            else:
-                # Fall back to regex on cell text
-                phs = [p for p in re.findall(r"0\d[\d\s]{7,10}", c1)
-                       if re.sub(r"\D", "", p) != kbo_digits]
-                if phs:
-                    normed = _ci_norm_phone(phs[0])
-                    if len(re.sub(r"\D", "", normed)) >= 9:
-                        out["phone"] = normed
-        if "E-mail" in c0:
-            em = re.search(r"[\w.+%-]+@[\w.-]+\.\w+", c1)
-            if em:
-                out["email"] = em.group().lower()
-        if "Webadres" in c0:
-            for a in row.find_all("a", href=True):
-                h = a["href"]
-                if h.startswith("http") and "kbo" not in h:
-                    out["domain"] = urlparse(h).netloc.replace("www.", "")
-        if "Adres van de zetel" in c0:
-            out["address"] = c1
-        if c0 in board_roles:
-            parts = c1.split(",")
-            name  = (f"{parts[1].strip()} {parts[0].strip()}"
-                     if len(parts) == 2 else c1)
-            # Skip legal entities acting as mandataries — their "name" in KBO
-            # is a KBO number (0XXX.XXX.XXX) or contains NV/BV/VZW/SA etc.
-            is_legal_entity = bool(
-                re.match(r"^0\d{3}[\s.]?\d{3}[\s.]?\d{3}$", name.strip()) or
-                re.search(r"\b(NV|BV|VZW|BVBA|SA|ASBL|SRL|CV|SCS|SNC)\b",
-                          name, re.IGNORECASE)
-            )
-            if not is_legal_entity:
-                out["mandataries"].append(
-                    {"name": name, "role": c0, "since": c2})
-
-    info(f"[CI-KBO] {out['name']} | {len(out['mandataries'])} mandataries")
-    return out
 
     # ── 2. Website scraper ────────────────────────────────────────────────
 
-def ci_scrape_website(domain: str, proxies: dict, delay: float) -> dict:
-    out = {"staff": [], "board": [], "emails": [], "phones": [], "pattern": "",
-           "functional": []}
-    if not _CI_HTTP:
-        return out
-
-    base = f"https://{domain}"
-    # Homepage always; also probe /contact since that's where phones live.
-    # We deliberately keep this list short — the old 14-path approach
-    # burned time on 404s and was removed. /contact is the one exception
-    # worth the extra request because it almost always has phone numbers.
-    urls_to_try = [base, base + "/contact"]
-
-    for url in urls_to_try:
-        r = _ci_get(url, proxies, delay * 0.4)
-        if not r:
-            continue
-        soup = _ci_soup(r)
-        text = soup.get_text(" ", strip=True)
-
-        for e in _ci_emails_from(text, domain):
-            if e not in out["emails"]:
-                out["emails"].append(e)
-        for a in soup.find_all("a", href=re.compile(r"mailto:", re.I)):
-            raw = a["href"].replace("mailto:", "").split("?")[0].strip().lower()
-            if "@" in raw and domain in raw and raw not in out["emails"]:
-                out["emails"].append(raw)
-
-        # Use structured soup extraction — far more reliable than regex on text
-        for ph in _ci_phones_from_soup(soup):
-            if ph not in out["phones"]:
-                out["phones"].append(ph)
-
-        for heading in soup.find_all(["h3", "h4", "strong", "b", "p"]):
-            name_raw = heading.get_text(" ", strip=True)
-            words    = name_raw.split()
-            if not (2 <= len(words) <= 4):
-                continue
-            if not all(w[0].isupper() for w in words if w and w[0].isalpha()):
-                continue
-            role_el  = heading.find_next_sibling()
-            role_raw = role_el.get_text(" ", strip=True) if role_el else ""
-            entry    = {"name": name_raw, "role": role_raw}
-            rl       = role_raw.lower()
-            if any(k in rl for k in ("coordinat", "staf", "medewerker",
-                                     "directeur", "director", "manager")):
-                out["staff"].append(entry)
-            elif any(k in rl for k in ("voorzitter", "bestuurder", "secretaris",
-                                       "penningmeester", "ondervoorzitter")):
-                out["board"].append(entry)
-
-    personal = [e for e in out["emails"]
-                if "." in e.split("@")[0]
-                and not _is_functional(e)]
-    out["pattern"] = f"voornaam.naam@{domain}" if personal else ""
-    out["functional"] = _rank_functional(
-        e for e in out["emails"] if _is_functional(e))
-    dedup = lambda lst: list({e["name"]: e for e in lst}.values())
-    out["staff"] = dedup(out["staff"])
-    out["board"]  = dedup(out["board"])
-    info(f"[CI-WEB] {len(out['emails'])} emails "
-         f"({len(out['functional'])} functional), {len(out['phones'])} phones, "
-         f"{len(out['staff'])} staff, {len(out['board'])} board entries")
-    return out
 
     # ── 3. Belgisch Staatsblad ────────────────────────────────────────────
 
-def ci_fetch_staatsblad(kbo: str, proxies: dict, delay: float) -> List[dict]:
-    clean = re.sub(r"[^0-9]", "", kbo)
-    r = _ci_get(_CI_STAATSBLAD, proxies, delay,
-    params={"language": "nl", "btw": clean, "page": 1})
-    if not r:
-        return []
-    soup  = _ci_soup(r)
-    names = []
-    for row in soup.find_all("tr"):
-        text = row.get_text(" ", strip=True)
-        if re.search(r"\b(bestuurder|mandataris|voorzitter|secretaris)\b",
-        text, re.I):
-            found = re.findall(
-            r"\b([A-ZÀÁÂ][a-zàáâãäåæç]+(?:\s+[A-ZÀÁÂ][a-zàáâãäåæç]+)+)\b",
-            text)
-            for n in found:
-                if len(n.split()) >= 2:
-                    names.append({"name": n, "source": "Staatsblad"})
-    dedup = list({e["name"]: e for e in names}.values())
-    if dedup:
-        info(f"[CI-SB] {len(dedup)} name mentions")
-    return dedup
 
                 # ── 4-6. Search engine SERPs ─────────────────────────────────────────
 
-def _ci_serp_links(soup) -> List[str]:
-    links = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        h = a["href"]
-        if "/url?q=" in h:
-            h = re.sub(r"^.*?/url\?q=([^&]+).*$", r"\1", h)
-        if (h.startswith("http") and "google.com" not in h
-            and "bing.com" not in h and "duckduckgo.com" not in h):
-            if h not in seen:
-                seen.add(h)
-                links.append(h)
-    return links
 
-def _ci_serp_text(soup) -> str:
-    for s in soup(["script", "style", "nav", "header", "footer"]):
-        s.decompose()
-    return soup.get_text(" ", strip=True)
 
-def _ci_google(query: str, proxies: dict, delay: float):
-    url = f"https://www.google.com/search?q={_qp(query)}&hl=nl&num=10"
-    r = _ci_get(url, proxies, delay, extra_headers={"Accept-Language": "nl-BE"})
-    if not r:
-        return [], ""
-    soup = _ci_soup(r)
-    return _ci_serp_links(soup), _ci_serp_text(soup)
 
-def _ci_bing(query: str, proxies: dict, delay: float):
-    r = _ci_get("https://www.bing.com/search", proxies, delay,
-    params={"q": query, "setlang": "nl-BE"})
-    if not r:
-        return [], ""
-    soup = _ci_soup(r)
-    return _ci_serp_links(soup), _ci_serp_text(soup)
 
-def _ci_ddg(query: str, proxies: dict, delay: float):
-    r = _ci_get("https://html.duckduckgo.com/html/", proxies, delay,
-    params={"q": query, "kl": "be-nl"})
-    if not r:
-        return [], ""
-    soup = _ci_soup(r)
-    return _ci_serp_links(soup), _ci_serp_text(soup)
 
-def _ci_linkedin_search_url(name: str, org: str) -> str:
-    """Always-available manual LinkedIn search URL for the analyst."""
-    return (f"https://www.linkedin.com/search/results/people/"
-    f"?keywords={_qp(name + ' ' + org)}")
 
-def ci_try_linkedin_pubdir(first: str, last: str,
-    proxies: dict, delay: float) -> str:
-    """
-    Try LinkedIn pub/dir — a public legacy endpoint that lists matching
-    profiles without requiring login. Returns first matching profile URL
-    or empty string.
-    """
-    if not _CI_HTTP or not first or not last:
-        return ""
-    f_slug = re.sub(r"[^a-z]", "", first.lower())
-    l_slug = re.sub(r"[^a-z]", "", last.lower())
-    url = f"https://www.linkedin.com/pub/dir/{f_slug}/{l_slug}"
-    r = _ci_get(url, proxies, delay * 0.5, extra_headers={
-    "Referer": "https://www.google.com/"})
-    if not r:
-        return ""
-    soup = _ci_soup(r)
-    for a in soup.find_all("a", href=re.compile(r"linkedin.com/in/")):
-        href = a.get("href", "").split("?")[0].rstrip("/")
-        if "/in/" in href:
-            info(f"[CI-LI] pub/dir hit: {href}")
-            return href
-    return ""
 
-def ci_fetch_linkedin_company(domain: str, proxies: dict, delay: float) -> str:
-    """
-    Fetch LinkedIn company page — returns the about/description text.
-    Slug is guessed from the root domain label (lotusbakeries → lotusbakeries).
-    """
-    if not _CI_HTTP:
-        return ""
-    slug = domain.split(".")[0].lower()
-    slug = re.sub(r"[^a-z0-9-]", "", slug)
-    url  = f"https://www.linkedin.com/company/{slug}"
-    r = _ci_get(url, proxies, delay * 0.5, extra_headers={
-    "Referer": "https://www.google.com/"})
-    if not r:
-        return ""
-    soup = _ci_soup(r)
-    # og:description often has "X followers · Industry · About" text
-    og = soup.find("meta", property="og:description")
-    if og and og.get("content"):
-        return og["content"][:300]
-    return ""
 
-def ci_run_serps(name: str, org: str, domain: str,
-    proxies: dict, delay: float) -> dict:
-    result = {"linkedin_url": "", "emails": [], "phones": [],
-    "mentions": [], "sources": []}
-
-    # LinkedIn-specific query runs on ALL three engines — not rotating.
-    # Google blocks most, but Bing and DDG often return results.
-    li_query   = f'"{name}" "{org}" site:linkedin.com/in'
-    mail_query = f'"{name}" "{org}" email'
-    all_links: List[str] = []
-    all_text:  str = ""
-
-    for engine_fn, engine_name in [(_ci_ddg, "DDG"),
-                                   (_ci_bing, "Bing"),
-                                   (_ci_google, "Google")]:
-        time.sleep(delay * 0.3)
-        links, text = engine_fn(li_query, proxies, 0)
-        all_links.extend(links)
-        all_text += " " + text
-        if links:
-            result["sources"].append(engine_name)
-        # Stop as soon as we find a LinkedIn URL
-        if any("linkedin.com/in/" in l for l in links):
-            break
-
-    # One email/mention pass using DDG (most permissive)
-    time.sleep(delay * 0.3)
-    links2, text2 = _ci_ddg(mail_query, proxies, 0)
-    all_links.extend(links2)
-    all_text += " " + text2
-
-    for l in all_links:
-        if "linkedin.com/in/" in l:
-            result["linkedin_url"] = l.split("?")[0].rstrip("/")
-            break
-
-    result["emails"] = _ci_emails_from(all_text, domain)
-    result["phones"] = _ci_phones_from(all_text)
-
-    _SERP_NOISE = re.compile(
-        r"please click here|send feedback|privacy policy|terms of service"
-        r"|cookie|translate this page|more results|did you mean"
-        r"|people also ask|related searches",
-        re.IGNORECASE)
-
-    first_word = name.split()[0] if name.strip() else ""
-    if first_word:
-        for m in re.finditer(re.escape(first_word), all_text, re.I):
-            s    = max(0, m.start() - 40)
-            e    = min(len(all_text), m.end() + 120)
-            snip = all_text[s:e].strip()
-            if _SERP_NOISE.search(snip):
-                continue
-            if org.lower()[:4] in snip.lower() or domain in snip.lower():
-                result["mentions"].append(snip[:200])
-                if len(result["mentions"]) >= 3:
-                    break
-
-    return result
 
 # ── 7. LinkedIn public profile ────────────────────────────────────────
 
-def ci_fetch_linkedin(url: str, proxies: dict, delay: float) -> dict:
-    if not url or not _CI_HTTP:
-        return {}
-    r = _ci_get(url, proxies, delay,
-    extra_headers={"Referer": "https://www.google.com/"})
-    if not r:
-        return {}
-    soup   = _ci_soup(r)
-    result = {"url": url, "role": "", "company": ""}
-
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        m = re.match(r"^.+?\s*[-–]\s*(.+?)\s*(?:at|bij|@|\|)", og["content"])
-        if m:
-            result["role"] = m.group(1).strip()
-        m2 = re.search(r"(?:at|bij|@)\s+(.+?)(?:\s*\||\s*$)", og["content"])
-        if m2:
-            result["company"] = m2.group(1).strip()
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "{}")
-            if isinstance(data, list):
-                data = next((d for d in data if d.get("@type") == "Person"), {})
-            if data.get("@type") == "Person":
-                result["role"]    = result["role"]    or data.get("jobTitle", "")
-                wf = data.get("worksFor", {})
-                result["company"] = result["company"] or (
-                    wf.get("name", "") if isinstance(wf, dict) else "")
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    return result
 
     # ── 8a. EmailFormat.com (free, no key) ───────────────────────────────
 
-def ci_query_emailformat(domain: str, proxies: dict, delay: float) -> dict:
-    """
-    Scrape email-format.com to discover the company's standard email pattern
-    and any indexed individual addresses. Completely free, no API key.
-    Returns {"pattern": str, "emails": [str]}
-    """
-    if not _CI_HTTP:
-        return {}
-    r = _ci_get(f"{_CI_EMAILFMT_URL}/{domain}/", proxies, delay * 0.4)
-    if not r:
-        return {}
-    soup    = _ci_soup(r)
-    result  = {"pattern": "", "emails": []}
-    # Pattern is shown in a <span class="email-format"> or similar element
-    for el in soup.find_all(string=re.compile(r"[{(]first[*.]?name[})]|[{(]f[})]",
-    re.I)):
-        text = el.strip()
-        if "@" in text and domain in text:
-            result["pattern"] = text.strip()
-            break
-    # Also grab any individual emails listed
-    for em in re.findall(r"[\w.+-]{2,}@" + re.escape(domain), soup.get_text()):
-        em_l = em.lower()
-        if em_l not in result["emails"]:
-            result["emails"].append(em_l)
-    if result["pattern"] or result["emails"]:
-        info(f"[CI-EF] pattern={result['pattern'] or 'n/a'} "
-             f"| {len(result['emails'])} emails")
-    return result
 
                 # ── 8b. Infobel.be (free Belgian business directory) ─────────────────
 
-def ci_query_infobel(org_name: str, proxies: dict, delay: float) -> dict:
-    """
-    Search Infobel Belgium for the company — returns phone and address
-    if listed. Completely free, no API key.
-    """
-    if not _CI_HTTP:
-        return {}
-    query = re.sub(r"\s+", "+", org_name.strip()[:40])
-    r = _ci_get(f"{_CI_INFOBEL_URL}/{query}", proxies, delay * 0.5)
-    if not r:
-        return {}
-    soup   = _ci_soup(r)
-    result = {"phone": "", "address": ""}
-    # Infobel shows phone in tel: links
-    tel = soup.find("a", href=re.compile(r"tel:"))
-    if tel:
-        raw = tel["href"].replace("tel:", "").strip()
-        normed = _ci_norm_phone(raw)
-        if len(re.sub(r"\D", "", normed)) >= 9:
-            result["phone"] = normed
-
-    # Address in structured data
-    for sd in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(sd.string or "{}")
-        except (json.JSONDecodeError, TypeError):
-            continue
-        candidates = data if isinstance(data, list) else [data]
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            if item.get("@type") not in ("LocalBusiness", "Organization"):
-                continue
-            addr = item.get("address", {})
-            if isinstance(addr, dict):
-                assembled = (f"{addr.get('streetAddress', '')} "
-                             f"{addr.get('postalCode', '')} "
-                             f"{addr.get('addressLocality', '')}").strip()
-                if assembled:
-                    result["address"] = assembled
-                    break
-        if result["address"]:
-            break
-
-    if result["phone"] or result["address"]:
-        info(f"[CI-IB] phone={result['phone'] or 'n/a'} "
-             f"address={result['address'][:40] or 'n/a'}")
-    return result
 
                 # ── 8b2. Gouden Gids / Pages d'Or ────────────────────────────────────
 
-def ci_query_goudengids(org_name: str, proxies: dict, delay: float) -> dict:
-    """
-    Gouden Gids (goudengids.be) / Pages d'Or — Belgian Yellow Pages.
-    Authoritative for most NIS2-regulated Belgian companies.
-    Free, no API key.
-    """
-    if not _CI_HTTP:
-        return {}
-    result = {"phone": "", "address": ""}
-    for base_url in ("https://www.goudengids.be/nl/zoeken/",
-    "https://www.pagesdor.be/fr/recherche/"):
-        r = _ci_get(base_url, proxies, delay * 0.5,
-        params={"q": org_name[:50]})
-        if not r:
-            continue
-        soup = _ci_soup(r)
-        for a in soup.find_all("a", href=re.compile(r"^tel:", re.I)):
-            raw = a["href"][4:].strip()
-            normed = _ci_norm_phone(raw)
-            if len(re.sub(r"\D", "", normed)) >= 9:
-                result["phone"] = normed
-                break
-
-        if not result["address"]:
-            for el in soup.select("[class*='address'],[itemprop='address'],"
-                                  "[itemprop='streetAddress']"):
-                text = el.get_text(" ", strip=True)
-                if text and len(text) > 5:
-                    result["address"] = text[:120]
-                    break
-
-        for sd in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(sd.string or "{}")
-            except (json.JSONDecodeError, TypeError):
-                continue
-            candidates = data if isinstance(data, list) else [data]
-            for item in candidates:
-                if not isinstance(item, dict):
-                    continue
-                if not result["phone"]:
-                    ph = item.get("telephone", "")
-                    if ph:
-                        normed = _ci_norm_phone(str(ph))
-                        if len(re.sub(r"\D", "", normed)) >= 9:
-                            result["phone"] = normed
-                if not result["address"]:
-                    addr = item.get("address", {})
-                    if isinstance(addr, dict):
-                        assembled = (f"{addr.get('streetAddress', '')} "
-                                     f"{addr.get('postalCode', '')} "
-                                     f"{addr.get('addressLocality', '')}").strip()
-                        if assembled:
-                            result["address"] = assembled[:120]
-            if result["phone"] and result["address"]:
-                break
-        if result["phone"] and result["address"]:
-            break
-
-    if result["phone"] or result["address"]:
-        info(f"[CI-GG] phone={result['phone'] or 'n/a'}  "
-             f"address={result['address'][:40] or 'n/a'}")
-    return result
 
                     # ── 8b3. RIZIV/INAMI — Belgian healthcare provider registry ───────────
 
-def ci_query_riziv(org_name: str, kbo: str,
-    proxies: dict, delay: float) -> dict:
-    """
-    RIZIV/INAMI public institution register — hospitals, care homes,
-    GP practices, pharmacies. Authoritative for Health sector NIS2.
-    Free, no key.
-    """
-    if not _CI_HTTP:
-        return {}
-    result = {"phone": "", "address": "", "riziv_number": ""}
-    clean_kbo = re.sub(r"\D", "", kbo)
-
-    r = _ci_get(
-        "https://ondpanon.riziv.fgov.be/Home/InstitutionSearch",
-        proxies, delay * 0.5,
-        params={"enterpriseNumber": clean_kbo})
-    if r:
-        soup = _ci_soup(r)
-        for a in soup.find_all("a", href=re.compile(r"^tel:", re.I)):
-            raw = a["href"][4:].strip()
-            normed = _ci_norm_phone(raw)
-            if len(re.sub(r"\D", "", normed)) >= 9:
-                result["phone"] = normed
-                break
-        for el in soup.find_all(string=re.compile(r"\b\d{7}\b")):
-            m = re.search(r"\b(\d{7})\b", el)
-            if m:
-                result["riziv_number"] = m.group(1)
-                break
-
-    if result["phone"]:
-        info(f"[CI-RIZIV] phone={result['phone']}  "
-             f"RIZIV#={result['riziv_number'] or 'n/a'}")
-    return result
 
 # ── 8b4. VREG — Flemish energy regulator ──────────────────────────────
 
-def ci_query_vreg(org_name: str, kbo: str,
-    proxies: dict, delay: float) -> dict:
-    """
-    VREG public register of licensed energy suppliers, DSOs and producers.
-    Relevant for Energy sector NIS2 targets. Free, no key.
-    """
-    if not _CI_HTTP:
-        return {}
-    result = {"phone": "", "license_type": ""}
-    clean_kbo = re.sub(r"\D", "", kbo)
-
-    r = _ci_get(
-        "https://www.vreg.be/nl/vergunningenregister",
-        proxies, delay * 0.5,
-        params={"ondernemingsnummer": clean_kbo, "naam": org_name[:40]})
-    if r:
-        soup = _ci_soup(r)
-        for a in soup.find_all("a", href=re.compile(r"^tel:", re.I)):
-            raw = a["href"][4:].strip()
-            normed = _ci_norm_phone(raw)
-            if len(re.sub(r"\D", "", normed)) >= 9:
-                result["phone"] = normed
-                break
-        for el in soup.select("[class*='license'],[class*='vergunning']"):
-            text = el.get_text(" ", strip=True)
-            if text:
-                result["license_type"] = text[:80]
-                break
-
-    # Fallback: VREG open data CSV (quarterly published)
-    if not result["phone"]:
-        try:
-            r2 = _ci_get(
-                "https://www.vreg.be/sites/default/files/"
-                "vergunningenregister.csv",
-                proxies, delay * 0.3)
-            if r2:
-                for line in r2.text.splitlines()[1:300]:
-                    if clean_kbo in line or org_name[:10].lower() in line.lower():
-                        for part in [p.strip().strip('"') for p in line.split(";")]:
-                            if re.match(r"0\d{8,9}$|^\+32", part):
-                                result["phone"] = _ci_norm_phone(part)
-                                break
-                    if result["phone"]:
-                        break
-        except Exception:
-            pass
-
-    if result["phone"]:
-        info(f"[CI-VREG] phone={result['phone']}  "
-             f"license={result['license_type'][:30] or 'n/a'}")
-    return result
 
 # ── 8b5. BIPT — Belgian telecom & digital infra regulator ─────────────
 
-def ci_query_bipt(org_name: str, kbo: str,
-    proxies: dict, delay: float) -> dict:
-    """
-    BIPT public operator register — licensed telecom, postal and digital
-    infrastructure providers. Relevant for Digital infrastructure and
-    Postal & courier NIS2 sectors. Free, no key.
-    """
-    if not _CI_HTTP:
-        return {}
-    result = {"phone": "", "operator_type": ""}
-    clean_kbo = re.sub(r"\D", "", kbo)
-
-    for search_url in (
-        "https://www.bipt.be/operators/publication/list-of-operators",
-        "https://www.ibpt.be/operateurs/publication/liste-des-operateurs",
-    ):
-        r = _ci_get(search_url, proxies, delay * 0.5)
-        if not r:
-            continue
-        soup = _ci_soup(r)
-        for row in soup.find_all("tr"):
-            text = row.get_text(" ", strip=True)
-            if clean_kbo in text or org_name[:12].lower() in text.lower():
-                for a in row.find_all("a", href=re.compile(r"^tel:", re.I)):
-                    raw = a["href"][4:].strip()
-                    normed = _ci_norm_phone(raw)
-                    if len(re.sub(r"\D", "", normed)) >= 9:
-                        result["phone"] = normed
-                        break
-                cells = row.find_all("td")
-                if cells:
-                    result["operator_type"] = cells[0].get_text(
-                        " ", strip=True)[:60]
-                if result["phone"]:
-                    break
-        if result["phone"]:
-            break
-
-    if result["phone"]:
-        info(f"[CI-BIPT] phone={result['phone']}  "
-             f"type={result['operator_type'][:30] or 'n/a'}")
-    return result
 
 # ── 8c. Apollo.io (optional API key, 150 free credits/month) ──────────
 
-def ci_query_apollo(domain: str, api_key: str) -> dict:
-    """
-    Apollo.io people search by domain — returns verified emails, names
-    and titles. Free tier: 150 credits/month. Requires API key via
-    –apollo-key flag.
-    """
-    if not api_key or not _CI_HTTP:
-        return {}
-    session = _ci_session()
-    if session is None:
-        return {}
-    try:
-        r = session.post(
-            f"{_CI_APOLLO_API}/mixed_people/search",
-            headers={
-                "Content-Type": "application/json",
-                "Cache-Control": "no-cache",
-                "X-Api-Key": api_key,
-            },
-            json={"q_organization_domains": domain, "page": 1, "per_page": 10},
-            timeout=15,
-        )
-        data = r.json()
-        people = data.get("people", [])
-        info(f"[CI-APOLLO] {len(people)} people found for {domain}")
-        return {
-        "emails": [
-        {"email":    p.get("email", ""),
-        "first":    p.get("first_name", ""),
-        "last":     p.get("last_name", ""),
-        "position": p.get("title", ""),
-        "linkedin": p.get("linkedin_url", "")}
-        for p in people if p.get("email")
-        ]
-        }
-    except Exception as exc:
-        warn(f"[CI-APOLLO] {exc}")
-        return {}
 
     # ── 8d. Hunter.io ─────────────────────────────────────────────────────
 
-_CI_HUNTER_CACHE_FILE = "hunter_cache.json"   # persistent, campaign-independent
+_CI_HUNTER_CACHE_FILE = HUNTER_CACHE_FILE   # alias to the central name
 _CI_HUNTER_CACHE: Optional[dict] = None
 _CI_HUNTER_QUOTA_EXHAUSTED = False             # set on first 429 so we stop calling
 
@@ -5120,131 +4475,12 @@ def ci_smtp_verify(email: str, mx_host: Optional[str] = None) -> str:
 _SECURITY_TXT_PATHS = ["/.well-known/security.txt", "/security.txt"]
 
 # Dedicated pages that commonly publish a functional/compliance mailbox.
-_CONTACT_PAGES = ["/contact", "/contacts", "/contact-us", "/privacy",
-                  "/privacybeleid", "/privacy-policy", "/gdpr", "/avg",
-                  "/dpo", "/klokkenluider", "/security", "/legal",
-                  "/over-ons", "/about"]
 
-def _emails_on_domain(text: str, domain: str) -> List[str]:
-    out = []
-    for e in re.findall(r"[\w.+%-]+@[\w.-]+\.\w+", text or ""):
-        el = e.lower()
-        if el.endswith("@" + domain) or el.endswith("." + domain):
-            if el not in out:
-                out.append(el)
-    return out
 
-def soa_rname_email(domain: str) -> str:
-    """The SOA record's responsible-person mailbox (RNAME), dots-to-@ decoded."""
-    if not _CI_DNS or not domain:
-        return ""
-    try:
-        ans = _dns_resolver.resolve(domain, "SOA")
-        rname = str(ans[0].rname).rstrip(".")
-    except Exception:
-        return ""
-    # First unescaped dot separates local-part from domain.
-    parts = re.split(r"(?<!\\)\.", rname, maxsplit=1)
-    if len(parts) == 2:
-        local = parts[0].replace("\\.", ".")
-        return f"{local}@{parts[1]}".lower()
-    return ""
 
-def dmarc_report_emails(domain: str) -> List[str]:
-    """Mailboxes from the _dmarc TXT record's rua/ruf report addresses."""
-    if not _CI_DNS or not domain:
-        return []
-    try:
-        ans = _dns_resolver.resolve(f"_dmarc.{domain}", "TXT")
-    except Exception:
-        return []
-    txt = " ".join(b.decode(errors="replace") if isinstance(b, bytes) else str(b)
-                   for r in ans for b in r.strings)
-    out = []
-    for m in re.findall(r"(?:rua|ruf)=([^;]+)", txt, re.I):
-        for addr in m.split(","):
-            addr = addr.strip()
-            if addr.lower().startswith("mailto:"):
-                e = addr[7:].strip().lower()
-                if "@" in e and e not in out:
-                    out.append(e)
-    return out
 
-def tls_cert_emails(domain: str) -> List[str]:
-    """Any emailAddress fields in the site's TLS certificate subject/SANs."""
-    if not domain:
-        return []
-    import ssl as _ssl
-    ctx = _ssl.create_default_context()
-    out = []
-    try:
-        with socket.create_connection((domain, 443), timeout=6) as sock:
-            with ctx.wrap_socket(sock, server_hostname=domain) as ss:
-                cert = ss.getpeercert()
-    except Exception:
-        return []
-    for field in cert.get("subject", ()) + cert.get("issuer", ()):
-        for k, v in field:
-            if k == "emailAddress" and "@" in v:
-                out.append(v.lower())
-    for typ, val in cert.get("subjectAltName", ()):
-        if typ.lower() == "email" and "@" in val:
-            out.append(val.lower())
-    return list(dict.fromkeys(out))
 
-def whois_abuse_mailbox(domain: str) -> str:
-    """RIPE abuse-c mailbox for the IP the domain resolves to.
 
-    This is the *hosting network's* abuse desk (mandated in the RIPE region),
-    correct for network-abuse reports but NOT the organisation's own inbox.
-    """
-    try:
-        ip = socket.gethostbyname(domain)
-    except Exception:
-        return ""
-    def _q(server, query):
-        try:
-            with socket.create_connection((server, 43), timeout=6) as s:
-                s.sendall((query + "\r\n").encode())
-                buf = b""
-                while True:
-                    d = s.recv(4096)
-                    if not d:
-                        break
-                    buf += d
-                return buf.decode(errors="replace")
-        except Exception:
-            return ""
-    # RIPE returns abuse-mailbox directly with the -b flag.
-    text = _q("whois.ripe.net", f"-b {ip}")
-    m = re.search(r"abuse-mailbox:\s*([\w.+%-]+@[\w.-]+\.\w+)", text, re.I)
-    if m:
-        return m.group(1).lower()
-    m = re.search(r"%\s*Abuse contact for.*?is\s*'([\w.+%-]+@[\w.-]+\.\w+)'",
-                  text, re.I | re.S)
-    return m.group(1).lower() if m else ""
-
-def scrape_contact_pages(domain: str, proxies: dict, delay: float) -> List[str]:
-    """Functional mailboxes published on dedicated contact/privacy/DPO pages."""
-    if not _CI_HTTP or not domain:
-        return []
-    out: List[str] = []
-    for path in _CONTACT_PAGES:
-        if len([e for e in out if _is_functional(e)]) >= 3:
-            break  # enough signal; don't fetch every page
-        r = _ci_get(f"https://{domain}{path}", proxies, delay * 0.25)
-        if not r or getattr(r, "status_code", 0) != 200:
-            continue
-        soup = _ci_soup(r)
-        for a in soup.find_all("a", href=re.compile(r"mailto:", re.I)):
-            raw = a["href"].replace("mailto:", "").split("?")[0].strip().lower()
-            if raw.endswith("@" + domain) and raw not in out:
-                out.append(raw)
-        for e in _emails_on_domain(soup.get_text(" ", strip=True), domain):
-            if e not in out:
-                out.append(e)
-    # Keep only functional addresses; discard scraped personal ones here.
-    return [e for e in out if _is_functional(e)]
 
 def fetch_security_txt(domain: str, proxies: dict, delay: float) -> dict:
     """Fetch and parse RFC 9116 security.txt — the canonical, purpose-built
@@ -5378,79 +4614,32 @@ def ci_run_single(kbo: str, domain: str,
     delay: float    = 1.8,
     no_smtp: bool   = False,
     proxies: dict   = None) -> CIOrgProfile:
-    """
-    Run all 9 contact intelligence sources for one company.
-    Returns a CIOrgProfile with ranked CIContact list.
+    """Contact discovery for one company — Hunter.io only.
+
+    Also resolves the org's security/abuse mailbox (via security.txt, plus
+    RFC 2142 aliases when SMTP is allowed) purely so the CCB disclosure report
+    can be addressed to the right team. No KBO mandatary lookup, no website
+    scraping, no SERP/LinkedIn/directory sources — those were removed.
     """
     if proxies is None:
         proxies = {"http": None, "https": None}
-    # Strip www. — email addresses must use the root domain, not the subdomain,
-    # otherwise MX lookup and SMTP verify will fail and inferred emails are wrong.
     domain = domain.replace("https://", "").replace("http://", "").strip("/")
     domain = re.sub(r"^www\.", "", domain)
     org    = CIOrgProfile(kbo=kbo, domain=domain)
 
-    # 1 KBO
-    header(f"[CI] Step 1/9  KBO  →  {kbo}")
-    kbo_data       = ci_fetch_kbo(kbo, proxies, delay)
-    org.name       = kbo_data.get("name", "")
-    org.org_phone  = kbo_data.get("phone", "")
-    org.org_email  = kbo_data.get("email", "")
-    org.address    = kbo_data.get("address", "")
-    if kbo_data.get("domain") and not domain:
-        domain     = kbo_data["domain"]
-        org.domain = domain
-
-    # 2 Website
-    header(f"[CI] Step 2/9  Website  →  {domain}")
-    web_data          = ci_scrape_website(domain, proxies, delay)
-    org.email_pattern = web_data.get("pattern") or f"voornaam.naam@{domain}"
-    if not org.org_phone and web_data["phones"]:
-        org.org_phone = web_data["phones"][0]
-
-    # Functional / role mailboxes — preferred, non-personal contact channel.
-    # Aggregate sources by authority: security.txt (declared) is authoritative;
-    # DMARC rua, SOA RNAME, TLS cert and dedicated pages add same-domain
-    # mailboxes; RIPE abuse-c is the hosting network's desk, kept separate.
+    # Security/abuse mailbox for the CCB report recipient (not person-contacts).
     sectxt = fetch_security_txt(domain, proxies, delay)
-    authoritative = list(sectxt.get("contacts", []))
-    same_domain: List[str] = []
-    for src in (dmarc_report_emails(domain),
-                tls_cert_emails(domain),
-                scrape_contact_pages(domain, proxies, delay)):
-        for e in src:
-            if e.endswith("@" + domain) and e not in same_domain:
-                same_domain.append(e)
-    soa = soa_rname_email(domain)
-    if soa and soa.endswith("@" + domain) and soa not in same_domain:
-        same_domain.append(soa)
-
     org.functional_emails = discover_functional_mailboxes(
-        domain, web_data.get("functional", []), no_smtp,
-        extra=authoritative + same_domain)
+        domain, [], no_smtp, extra=sectxt.get("contacts", []))
     org.security_contact = _pick_security_contact(
         org.functional_emails, sectxt.get("contacts", []))
     org.security_policy = sectxt.get("policy", "")
-    org.network_abuse = whois_abuse_mailbox(domain)
-    if org.functional_emails and not org.org_email:
-        org.org_email = org.functional_emails[0]
-    if not org.org_email:
-        org.org_email = next(
-            (e for e in web_data["emails"] if _is_functional(e)), "")
     if org.security_contact:
         detail(f"security contact: {org.security_contact}"
                + ("  (security.txt)" if sectxt.get("found") else ""))
-    if org.network_abuse:
-        detail(f"network abuse desk (host): {org.network_abuse}")
-    if org.functional_emails:
-        detail("functional mailboxes: " + ", ".join(org.functional_emails[:6]))
 
-    # ── Contact discovery: Hunter.io only ─────────────────────────────────
-    # All other person-level sources (Staatsblad, SERP, LinkedIn, EmailFormat,
-    # Infobel, Gouden Gids, RIZIV, VREG, BIPT, Apollo, SMTP verification) have
-    # been removed. The org's security/functional mailbox discovery from step 2
-    # (security.txt, DMARC, etc.) is retained — the CCB disclosure report needs
-    # it to address the right team.
+    # Contact discovery — Hunter.io, the sole source.
+    header(f"[CI] Contact discovery  →  Hunter.io  ({domain})")
     pool: Dict[str, CIContact] = {}
 
     def _upsert(name: str, role: str, source: str,
@@ -5468,11 +4657,11 @@ def ci_run_single(kbo: str, domain: str,
             c.sources.append(source)
         return c
 
-    # Hunter.io domain search — the sole contact source.
-    header(f"[CI] Contact discovery  →  Hunter.io  ({domain})")
     hunter = ci_query_hunter(domain, hunter_key)
     if hunter.get("pattern"):
         org.email_pattern = hunter["pattern"] + "@" + domain
+    if hunter.get("organization") and not org.name:
+        org.name = hunter["organization"]
     for he in hunter.get("emails", []):
         name = f"{he['first']} {he['last']}".strip()
         if not name:
@@ -5480,8 +4669,7 @@ def ci_run_single(kbo: str, domain: str,
         c = _upsert(name, he.get("position", ""), "Hunter.io",
                     phone=he.get("phone", ""),
                     phone_type="direct" if he.get("phone") else "")
-        c.email        = he["email"]
-        # Reflect Hunter's own verification if present, else confidence.
+        c.email = he["email"]
         vs = he.get("verify_status", "")
         if vs == "valid":
             c.email_status = "confirmed (Hunter)"
@@ -5497,7 +4685,6 @@ def ci_run_single(kbo: str, domain: str,
 
     for c in pool.values():
         c.score = ci_score(c)
-
     org.contacts = sorted(pool.values(), key=lambda x: x.score, reverse=True)
     detail(f"Hunter.io: {len(org.contacts)} contact(s)"
            + (f", pattern {hunter['pattern']}" if hunter.get("pattern") else ""))
@@ -6260,7 +5447,6 @@ class _SharePointClient:
 # FIXED SharePoint path (overwrite) each run.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SCAN_LEDGER_DEFAULT = "scan_ledger.csv"
 _LEDGER_FIELDS = ["domain", "entity", "company", "sector",
                   "first_scanned", "last_scanned", "scan_count",
                   "last_campaign", "last_findings"]
@@ -6442,16 +5628,16 @@ def maybe_upload_to_sharepoint(output_dir: str,
     else:
         if preferred_report_path:
             candidates.append(Path(preferred_report_path))
-        for name in (SCAN_RESULTS_HTML, "nis2_report.html", "nis2_summary_brief.html"):
+        for name in (SCAN_RESULTS_HTML, REPORT_HTML_ALT, SUMMARY_BRIEF_HTML):
             candidates.append(out_dir / name)
         candidates.extend(sorted(out_dir.glob("report_*.html")))
         if include_report_files:
             for name in (
                 SCAN_RESULTS_JSON, SCAN_RESULTS_CSV, SCAN_RESULTS_HTML,
                 "full_coverage_report.csv", "full_coverage_report.xlsx",
-                "combined_contacts.csv", "combined_contacts.json",
-                "contact_enrichment.csv", "contact_enrichment.json",
-                "nis2_companies_manifest.csv", "step_timings.json",
+                COMBINED_CONTACTS_CSV, COMBINED_CONTACTS_JSON,
+                CONTACT_ENRICHMENT_CSV, CONTACT_ENRICHMENT_JSON,
+                MANIFEST_FILE, "step_timings.json",
             ):
                 candidates.append(out_dir / name)
         if nuclei_output:
@@ -6569,7 +5755,7 @@ def maybe_deliver_report(output_dir: str,
     if preferred_report_path:
         report_candidates.append(Path(preferred_report_path))
     report_candidates.append(out_dir / SCAN_RESULTS_HTML)
-    report_candidates.append(out_dir / "nis2_report.html")
+    report_candidates.append(out_dir / REPORT_HTML_ALT)
     report_candidates.extend(sorted(out_dir.glob("report_*.html")))
 
     report_path = ""
@@ -6580,7 +5766,7 @@ def maybe_deliver_report(output_dir: str,
 
     summary = _build_report_summary(nuclei_output, scanned_hosts=scanned_hosts, orgs=orgs)
     if not report_path:
-        report_path = _write_scan_brief_html(summary, str(out_dir / "nis2_summary_brief.html"))
+        report_path = _write_scan_brief_html(summary, str(out_dir / SUMMARY_BRIEF_HTML))
         if not report_path:
             warn("No HTML report available for delivery.")
             return False
@@ -6593,8 +5779,8 @@ def maybe_deliver_report(output_dir: str,
             SCAN_RESULTS_HTML,
             "full_coverage_report.csv",
             "full_coverage_report.xlsx",
-            "combined_contacts.csv",
-            "combined_contacts.json",
+            COMBINED_CONTACTS_CSV,
+            COMBINED_CONTACTS_JSON,
             "step_timings.json",
         ):
             p = out_dir / name
@@ -6635,9 +5821,9 @@ def ci_enrich_from_scan(output_dir: str,
     header("POST-SCAN CONTACT ENRICHMENT")
     ci_hunter_account(hunter_key)   # one-off: prints remaining free-tier searches
 
-    manifest_path = Path(output_dir) / "nis2_companies_manifest.csv"
-    combined_path = Path(output_dir) / "contact_enrichment.csv"
-    json_path     = Path(output_dir) / "contact_enrichment.json"
+    manifest_path = Path(output_dir) / MANIFEST_FILE
+    combined_path = Path(output_dir) / CONTACT_ENRICHMENT_CSV
+    json_path     = Path(output_dir) / CONTACT_ENRICHMENT_JSON
     if not manifest_path.exists():
         warn(f"Manifest not found: {manifest_path} – run a scan first.")
         return
@@ -6694,9 +5880,9 @@ def ci_enrich_from_scan(output_dir: str,
             local_json_resolved = json_path
         for root, dirs, files in os.walk(Path.cwd()):
             dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
-            if "contact_enrichment.json" not in files:
+            if CONTACT_ENRICHMENT_JSON not in files:
                 continue
-            candidate = Path(root) / "contact_enrichment.json"
+            candidate = Path(root) / CONTACT_ENRICHMENT_JSON
             try:
                 candidate_resolved = candidate.resolve()
             except OSError:
@@ -6906,11 +6092,17 @@ def ci_enrich_from_scan(output_dir: str,
         all_orgs[kbo] = {
             "kbo": kbo, "name": org.name, "domain": org.domain,
             "findings": co.get("findings", 0),
+            "security_contact": org.security_contact,
+            "security_policy": org.security_policy,
+            "functional_emails": org.functional_emails,
+            "email_pattern": org.email_pattern,
             "contacts": [
                 {"score": c.score, "name": c.name, "role": c.role,
+                 "seniority": c.linkedin_role,
                  "email": c.email, "email_status": c.email_status,
-                 "phone": c.phone, "linkedin_url": c.linkedin_url}
-                for c in org.contacts[:5]
+                 "phone": c.phone, "linkedin_url": c.linkedin_url,
+                 "notes": c.notes}
+                for c in org.contacts[:10]
             ]
         }
 
@@ -6938,7 +6130,7 @@ def ci_enrich_from_scan(output_dir: str,
             warn(f"Could not write combined JSON: {e}")
 
         # HTML report
-        html_path = Path(output_dir) / "nis2_report.html"
+        html_path = Path(output_dir) / REPORT_HTML_ALT
         ci_export_html(list(all_orgs.values()), nuclei_output, str(html_path))
 
     header("CONTACT ENRICHMENT COMPLETE")
@@ -7176,7 +6368,7 @@ def main():
                 for c in org.contacts
             ]
         }
-        nuclei_out = os.path.join(out_dir, "nuclei_results.json")
+        nuclei_out = os.path.join(out_dir, NUCLEI_RESULTS_FILE)
         report_path = os.path.join(out_dir, f"report_{stem}.html")
         ci_export_html([org_dict], nuclei_out, report_path)
         maybe_deliver_report(
@@ -7240,9 +6432,9 @@ def main():
         error(f"Cannot create output dir '{args.output_dir}': {e}")
         sys.exit(1)
 
-    targets_file  = os.path.join(args.output_dir, "targets.txt")
-    nuclei_output = os.path.join(args.output_dir, "nuclei_results.json")
-    manifest_file = os.path.join(args.output_dir, "nis2_companies_manifest.csv")
+    targets_file  = os.path.join(args.output_dir, TARGETS_FILE)
+    nuclei_output = os.path.join(args.output_dir, NUCLEI_RESULTS_FILE)
+    manifest_file = os.path.join(args.output_dir, MANIFEST_FILE)
 
     if args.list_sectors:
         header("NIS2 Sectors")
