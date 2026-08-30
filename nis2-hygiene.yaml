@@ -3,27 +3,25 @@ id: nis2-web-hygiene
 # ─────────────────────────────────────────────────────────────────────────────
 # NIS2 web-security hygiene — DETECTION ONLY, max 5 requests per host.
 #
-# This template only OBSERVES what a host returns: response headers, cookie
-# flags, CORS behaviour, information disclosure, technology fingerprints, a few
-# well-known file exposures, and the TLS certificate. It sends NO exploit
-# payloads — no injection, no traversal to read files, no auth bypass, no
-# fuzzing. It confirms that a misconfiguration EXISTS; it never goes further.
+# Observes only: response headers, cookie flags, CORS behaviour, information
+# disclosure, technology fingerprints, exposed well-known files, and the TLS
+# certificate. Sends NO exploit input — no injection, no path traversal to read
+# files, no auth bypass, no fuzzing. It confirms a misconfiguration EXISTS and
+# goes no further (a CVDP safe-harbour condition).
 #
-# Legality: active scanning of systems you do not own is lawful in Belgium only
-# under authorised testing, or as good-faith coordinated disclosure under the
-# CVDP framework (art. 550bis §5 Sw.) — which requires prompt reporting to the
-# CCB and to the organisation, minimal testing, and no public disclosure. Use
-# it accordingly.
+# Requires nuclei v3+ (uses a multi-protocol http + ssl template). If your
+# nuclei predates v3, delete the trailing `ssl:` block and the 5th request.
+#
+# Absence checks use `negative: true` word matchers on `part: header`, the
+# documented pattern that reliably fires when a header is missing. (An earlier
+# revision used DSL `!contains(...)`, which is why nothing matched.)
 #
 # Request budget (5):
-#   1. GET /                       — headers, cookies, CORS, disclosure, tech, body
+#   1. GET /                         — headers, cookies, CORS, disclosure, tech, body
 #   2. GET /.well-known/security.txt — RFC 9116 presence / absence
-#   3. GET /robots.txt             — sensitive paths disclosed in robots
-#   4. GET /.git/config            — exposed version-control metadata
-#   5. TLS handshake ({{Host}}:443) — certificate & protocol hygiene
-#
-# Each matcher is independently named, so Nuclei emits one finding per issue
-# (the matcher-name), which downstream tooling reads directly.
+#   3. GET /robots.txt               — sensitive paths disclosed
+#   4. GET /.git/config              — exposed version-control metadata
+#   5. TLS handshake ({{Host}}:443)  — certificate & protocol hygiene
 # ─────────────────────────────────────────────────────────────────────────────
 
 info:
@@ -32,83 +30,102 @@ info:
   severity: info
   description: >
     Non-intrusive detection of common web-security misconfigurations relevant to
-    NIS2 posture: missing/weak security headers, insecure cookies, permissive
-    CORS, information disclosure, exposed well-known files, and TLS certificate
-    hygiene. Observation only; no exploitation.
+    NIS2 posture. Observation only; no exploitation.
   tags: nis2,misconfig,headers,tls,exposure,detection
   classification:
     cwe-id:
-      - CWE-16    # Configuration
-      - CWE-693   # Protection Mechanism Failure
-      - CWE-200   # Information Exposure
+      - CWE-16
+      - CWE-693
+      - CWE-200
 
 http:
-  # ── Request 1: root document — the bulk of the checks ──────────────────────
+  # ── Request 1: root document ───────────────────────────────────────────────
   - method: GET
     path:
       - "{{BaseURL}}/"
     headers:
-      # A benign test Origin lets us observe CORS reflection without any payload.
       Origin: "https://nis2-cors-probe.invalid"
     host-redirects: true
     max-redirects: 2
     matchers-condition: or
     matchers:
-      # — Security headers: absence —
-      - type: dsl
+      # — Missing security headers (negative word matchers) —
+      - type: word
         name: missing-hsts
-        dsl:
-          - "!contains(tolower(all_headers), 'strict-transport-security')"
-      - type: dsl
-        name: hsts-missing-includesubdomains
-        dsl:
-          - "contains(tolower(all_headers), 'strict-transport-security') && !contains(tolower(all_headers), 'includesubdomains')"
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["strict-transport-security"]
+      - type: word
+        name: missing-csp
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["content-security-policy"]
+      - type: word
+        name: missing-x-frame-options
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["x-frame-options", "frame-ancestors"]
+        condition: and
+      - type: word
+        name: missing-x-content-type-options
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["x-content-type-options"]
+      - type: word
+        name: missing-referrer-policy
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["referrer-policy"]
+      - type: word
+        name: missing-permissions-policy
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["permissions-policy"]
+      - type: word
+        name: missing-coop
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["cross-origin-opener-policy"]
+      - type: word
+        name: missing-corp
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["cross-origin-resource-policy"]
+      - type: word
+        name: missing-coep
+        part: header
+        case-insensitive: true
+        negative: true
+        words: ["cross-origin-embedder-policy"]
+
+      # — Weak header values (present, positive) —
+      - type: word
+        name: weak-csp-unsafe-inline
+        part: header
+        words: ["unsafe-inline"]
+      - type: word
+        name: weak-csp-unsafe-eval
+        part: header
+        words: ["unsafe-eval"]
       - type: regex
         name: weak-hsts-max-age
         part: header
         regex:
-          # max-age below ~1 year (any value with fewer than 8 digits)
-          - "(?i)strict-transport-security:[^\\r\\n]*max-age=[0-9]{1,7}(?:[^0-9]|$)"
+          - "(?i)strict-transport-security:[^\\r\\n]*max-age=[0-9]{1,7}([^0-9]|$)"
       - type: dsl
-        name: missing-csp
+        name: hsts-missing-includesubdomains
         dsl:
-          - "!contains(tolower(all_headers), 'content-security-policy')"
-      - type: word
-        name: weak-csp-unsafe-inline
-        part: header
-        words:
-          - "unsafe-inline"
-      - type: word
-        name: weak-csp-unsafe-eval
-        part: header
-        words:
-          - "unsafe-eval"
-      - type: dsl
-        name: missing-x-frame-options
-        dsl:
-          - "!contains(tolower(all_headers), 'x-frame-options') && !contains(tolower(all_headers), 'frame-ancestors')"
-      - type: dsl
-        name: missing-x-content-type-options
-        dsl:
-          - "!contains(tolower(all_headers), 'x-content-type-options')"
-      - type: dsl
-        name: missing-referrer-policy
-        dsl:
-          - "!contains(tolower(all_headers), 'referrer-policy')"
-      - type: dsl
-        name: missing-permissions-policy
-        dsl:
-          - "!contains(tolower(all_headers), 'permissions-policy')"
-      - type: dsl
-        name: missing-coop
-        dsl:
-          - "!contains(tolower(all_headers), 'cross-origin-opener-policy')"
-      - type: dsl
-        name: missing-corp
-        dsl:
-          - "!contains(tolower(all_headers), 'cross-origin-resource-policy')"
+          - "contains(tolower(all_headers), 'strict-transport-security') && !contains(tolower(all_headers), 'includesubdomains')"
 
-      # — Cookie flags —
+      # — Insecure cookies (compound: needs DSL) —
       - type: dsl
         name: cookie-missing-secure
         dsl:
@@ -126,13 +143,17 @@ http:
       - type: word
         name: cors-wildcard-origin
         part: header
-        words:
-          - "access-control-allow-origin: *"
+        case-insensitive: true
+        words: ["access-control-allow-origin: *"]
       - type: word
         name: cors-reflects-origin
         part: header
-        words:
-          - "access-control-allow-origin: https://nis2-cors-probe.invalid"
+        case-insensitive: true
+        words: ["access-control-allow-origin: https://nis2-cors-probe.invalid"]
+      - type: dsl
+        name: cors-allow-credentials-with-wildcard
+        dsl:
+          - "contains(tolower(all_headers), 'access-control-allow-credentials: true') && contains(tolower(all_headers), 'access-control-allow-origin: *')"
 
       # — Information / version disclosure —
       - type: regex
@@ -140,21 +161,29 @@ http:
         part: header
         regex:
           - "(?i)server:\\s*\\S+/[0-9]+\\.[0-9]"
-      - type: dsl
+      - type: word
         name: x-powered-by-disclosure
-        dsl:
-          - "contains(tolower(all_headers), 'x-powered-by')"
-      - type: dsl
+        part: header
+        case-insensitive: true
+        words: ["x-powered-by"]
+      - type: word
         name: aspnet-version-disclosure
-        dsl:
-          - "contains(tolower(all_headers), 'x-aspnet-version') || contains(tolower(all_headers), 'x-aspnetmvc-version')"
+        part: header
+        case-insensitive: true
+        words: ["x-aspnet-version", "x-aspnetmvc-version"]
+        condition: or
+      - type: word
+        name: basic-auth-over-cleartext
+        part: header
+        case-insensitive: true
+        words: ["www-authenticate: basic"]
       - type: regex
         name: internal-ip-in-headers
         part: header
         regex:
           - "(?i)(10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|172\\.(1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3})"
 
-      # — Technology fingerprint (body) —
+      # — Technology fingerprint (body / headers) —
       - type: regex
         name: generator-meta-disclosure
         part: body
@@ -163,26 +192,47 @@ http:
       - type: word
         name: tech-wordpress
         part: body
-        words:
-          - "/wp-content/"
-          - "/wp-includes/"
+        words: ["/wp-content/", "/wp-includes/"]
         condition: or
       - type: word
         name: tech-drupal
         part: body
-        words:
-          - "Drupal.settings"
-          - "/sites/default/files"
+        words: ["Drupal.settings", "/sites/default/files"]
         condition: or
       - type: word
         name: tech-joomla
         part: body
-        words:
-          - "/media/jui/"
-          - "com_content"
+        words: ["/media/jui/", "com_content", "Joomla!"]
         condition: or
+      - type: word
+        name: tech-magento
+        part: body
+        words: ["Mage.Cookies", "/static/version", "mage/cookies"]
+        condition: or
+      - type: word
+        name: tech-typo3
+        part: body
+        words: ["typo3temp", "typo3conf"]
+        condition: or
+      - type: word
+        name: tech-laravel
+        part: header
+        case-insensitive: true
+        words: ["laravel_session", "x-laravel"]
+        condition: or
+      - type: word
+        name: tech-django
+        part: header
+        case-insensitive: true
+        words: ["csrftoken", "sessionid=", "django"]
+        condition: or
+      - type: word
+        name: tech-express
+        part: header
+        case-insensitive: true
+        words: ["x-powered-by: express"]
 
-      # — Content integrity (body) —
+      # — Content integrity / disclosure (body) —
       - type: regex
         name: mixed-content-http-resource
         part: body
@@ -202,8 +252,42 @@ http:
           - "DEBUG = True"
           - "Symfony\\Component\\Debug"
         condition: or
+      - type: word
+        name: directory-listing
+        part: body
+        words: ["Index of /", "Parent Directory"]
+        condition: and
+      - type: word
+        name: default-webserver-page
+        part: body
+        words:
+          - "Welcome to nginx!"
+          - "Apache2 Ubuntu Default Page"
+          - "IIS Windows Server"
+          - "It works!"
+        condition: or
+      - type: word
+        name: phpinfo-disclosure
+        part: body
+        words: ["phpinfo()", "PHP Version", "php_uname"]
+        condition: and
+      - type: regex
+        name: private-key-disclosure
+        part: body
+        regex:
+          - "-----BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----"
+      - type: regex
+        name: aws-access-key-disclosure
+        part: body
+        regex:
+          - "AKIA[0-9A-Z]{16}"
+      - type: regex
+        name: html-comment-secret-hint
+        part: body
+        regex:
+          - "(?i)<!--[^>]*(password|passwd|api[_-]?key|secret|todo|fixme|hardcoded)"
 
-  # ── Request 2: RFC 9116 security.txt — presence / absence ──────────────────
+  # ── Request 2: RFC 9116 security.txt ───────────────────────────────────────
   - method: GET
     path:
       - "{{BaseURL}}/.well-known/security.txt"
@@ -218,7 +302,7 @@ http:
         dsl:
           - "status_code != 200"
 
-  # ── Request 3: robots.txt — sensitive paths disclosed ──────────────────────
+  # ── Request 3: robots.txt ──────────────────────────────────────────────────
   - method: GET
     path:
       - "{{BaseURL}}/robots.txt"
@@ -226,13 +310,12 @@ http:
     matchers:
       - type: word
         part: header
-        words:
-          - "text/plain"
+        words: ["text/plain"]
       - type: regex
         name: sensitive-paths-disclosed
         part: body
         regex:
-          - "(?i)disallow:\\s*/(admin|backup|backups|config|api|private|internal|\\.git|db|sql|old|tmp|test|staging)"
+          - "(?i)disallow:\\s*/(admin|backup|backups|config|api|private|internal|\\.git|db|sql|old|tmp|test|staging|wp-admin|phpmyadmin)"
 
   # ── Request 4: exposed version-control metadata (presence only) ────────────
   - method: GET
@@ -243,15 +326,12 @@ http:
       - type: word
         name: exposed-git-config
         part: body
-        words:
-          - "[core]"
-          - "repositoryformatversion"
+        words: ["[core]", "repositoryformatversion"]
         condition: and
       - type: word
         part: header
         negative: true
-        words:
-          - "text/html"
+        words: ["text/html"]
 
 # ── Request 5: TLS certificate & protocol hygiene (single handshake) ─────────
 ssl:
@@ -278,9 +358,3 @@ ssl:
         name: ssl-weak-protocol
         dsl:
           - "tls_version == 'tls10' || tls_version == 'tls11'"
-      - type: dsl
-        name: ssl-hostname-mismatch
-        dsl:
-          - "Host != subject_cn && !contains(subject_an, Host)"
-
-# End of template.
