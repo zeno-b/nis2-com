@@ -2705,9 +2705,11 @@ def write_ccb_disclosure_reports(nuclei_output: str,
         first_host = next(iter(data["hosts"]), "")
         netloc = urlparse(first_host if "://" in first_host
                           else "http://" + first_host).netloc or first_host
-        domain = netloc.replace("www.", "").strip("/")
+        domain = netloc.split(":")[0].replace("www.", "").strip("/").lower()
+        kbo_key = f"kbo:{_norm_kbo_key(co.get('entity', ''))}"
         discovered = functional_by_domain.get(domain, [])
-        sec_mailbox = (security_by_domain.get(domain)
+        sec_mailbox = (security_by_domain.get(kbo_key)
+                       or security_by_domain.get(domain)
                        or next((e for e in discovered
                                 if _local_part(e) in
                                 ("security", "abuse", "soc", "cert", "psirt")), "")
@@ -2801,7 +2803,8 @@ def write_ccb_disclosure_reports(nuclei_output: str,
                 lines.append("")
 
         # Contact enrichment (Hunter.io) for this organisation.
-        org_contacts = contacts_by_domain.get(domain, [])
+        org_contacts = (contacts_by_domain.get(kbo_key)
+                        or contacts_by_domain.get(domain, []))
         if org_contacts:
             lines.append("-" * 74)
             lines.append("CONTACTPERSONEN / CONTACTS  (bron / source: Hunter.io)")
@@ -3049,8 +3052,12 @@ def _load_functional_mailboxes(output_dir: str) -> Dict[str, List[str]]:
             out[dom] = fem
     return out
 
+def _norm_kbo_key(value: str) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
 def _load_security_contacts(output_dir: str) -> Dict[str, str]:
-    """domain -> declared/best security contact, from contact_enrichment.json."""
+    """Return {kbo: contact, domain: contact} — indexed by BOTH so the CCB
+    report can match on the company's entity number (reliable) or its domain."""
     out: Dict[str, str] = {}
     p = Path(output_dir) / CONTACT_ENRICHMENT_JSON
     if not p.exists():
@@ -3059,17 +3066,22 @@ def _load_security_contacts(output_dir: str) -> Dict[str, str]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return out
-    orgs = data if isinstance(data, list) else [data]
-    for entry in orgs:
+    for entry in (data if isinstance(data, list) else [data]):
         org = entry.get("org", entry) if isinstance(entry, dict) else {}
-        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
         sc = str(org.get("security_contact", "")).strip()
-        if dom and sc:
+        if not sc:
+            continue
+        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
+        kbo = _norm_kbo_key(org.get("kbo", ""))
+        if dom:
             out[dom] = sc
+        if kbo:
+            out[f"kbo:{kbo}"] = sc
     return out
 
 def _load_org_contacts(output_dir: str) -> Dict[str, list]:
-    """domain -> list of Hunter-found contacts, from contact_enrichment.json."""
+    """Return {kbo: contacts, domain: contacts} — indexed by BOTH, so the CCB
+    report can match on entity number or domain."""
     out: Dict[str, list] = {}
     p = Path(output_dir) / CONTACT_ENRICHMENT_JSON
     if not p.exists():
@@ -3082,10 +3094,15 @@ def _load_org_contacts(output_dir: str) -> Dict[str, list]:
         if not isinstance(entry, dict):
             continue
         org = entry.get("org", entry)
-        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
         contacts = org.get("contacts") or []
-        if dom and contacts:
+        if not contacts:
+            continue
+        dom = str(org.get("domain", "")).strip().lower().replace("www.", "")
+        kbo = _norm_kbo_key(org.get("kbo", ""))
+        if dom:
             out[dom] = contacts
+        if kbo:
+            out[f"kbo:{kbo}"] = contacts
     return out
 
 def write_intro_emails(scanned_hosts: List[str],
