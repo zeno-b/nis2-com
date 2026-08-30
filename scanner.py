@@ -1932,7 +1932,6 @@ def save_outputs(nis2_df, websites, denominations, targets_file, manifest_file,
         # This lets --limit select N *new* targets, and lets the caller's
         # widening loop pull more companies when the current pool is exhausted.
         if scan_ledger:
-            before_led = len(urls)
             urls, skipped_led = filter_unscanned(urls, scan_ledger)
             if skipped_led:
                 header("STEP 5f.6 – SCAN LEDGER FILTER")
@@ -2562,6 +2561,72 @@ def _slug(text: str, fallback: str = "company") -> str:
     s = re.sub(r"[^\w\- ]", "", str(text or "")).strip().replace(" ", "_")
     s = re.sub(r"_+", "_", s)
     return s[:80] or fallback
+
+def write_no_findings_folder(scanned_hosts: List[str],
+    nuclei_output: str,
+    output_dir: str,
+    lookup: dict,
+    hostname_index: dict) -> List[str]:
+    """Write companies scanned with ZERO findings into a separate folder.
+
+    Companies with findings get a CCB disclosure report (see
+    write_ccb_disclosure_reports); everyone else is recorded here as clean, one
+    marker file per company under no_findings/, so the two sets never mix.
+    """
+    # Hosts that produced at least one finding.
+    hosts_with_findings = set()
+    p = Path(nuclei_output)
+    if p.exists() and p.stat().st_size > 0:
+        for finding in stream_findings(p):
+            h = _finding_host(finding)
+            if h:
+                hosts_with_findings.add(_ledger_key(h))
+
+    # Group scanned companies with no findings (dedup by company).
+    clean: Dict[str, dict] = {}
+    for host in (scanned_hosts or []):
+        if _ledger_key(host) in hosts_with_findings:
+            continue
+        co = _company_record(host, lookup, hostname_index)
+        key = co.get("entity") or co.get("name") or host
+        clean.setdefault(key, {"co": co, "host": host})
+
+    if not clean:
+        return []
+
+    folder = Path(output_dir) / "no_findings"
+    folder.mkdir(parents=True, exist_ok=True)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    written: List[str] = []
+    for key, data in clean.items():
+        co = data["co"]
+        name = co.get("name") or key
+        lines = [
+            "=" * 60,
+            f"NO FINDINGS — {name}",
+            "=" * 60,
+            f"Scanned : {generated}",
+        ]
+        if co.get("entity"):
+            lines.append(f"Entity  : {co['entity']}")
+        if co.get("sector"):
+            lines.append(f"Sector  : {co['sector']}")
+        lines.append(f"Host    : {data['host']}")
+        lines.append("")
+        lines.append("The scan produced no findings for this company. Nothing "
+                     "to disclose.")
+        slug = _slug(name)
+        fp = folder / f"{slug}.txt"
+        n = 2
+        while fp.exists():
+            fp = folder / f"{slug}_{n}.txt"
+            n += 1
+        fp.write_text("\n".join(lines), encoding="utf-8")
+        written.append(str(fp))
+
+    if written:
+        ok(f"{len(written)} company(ies) with no findings → {folder}")
+    return written
 
 def write_ccb_disclosure_reports(nuclei_output: str,
     output_dir: str,
@@ -4880,27 +4945,95 @@ def ci_query_apollo(domain: str, api_key: str) -> dict:
 
     # ── 8d. Hunter.io ─────────────────────────────────────────────────────
 
-def ci_query_hunter(domain: str, api_key: str) -> dict:
+_CI_HUNTER_CACHE_FILE = "hunter_cache.json"   # persistent, campaign-independent
+_CI_HUNTER_CACHE: Optional[dict] = None
+_CI_HUNTER_QUOTA_EXHAUSTED = False             # set on first 429 so we stop calling
+
+def _hunter_cache() -> dict:
+    """Lazy-load the on-disk Hunter cache (domain -> full result).
+
+    Free tier is only 25 searches/month, so every domain is cached the first
+    time it is searched and never queried again. The cache lives in the current
+    working directory and is shared across campaigns.
+    """
+    global _CI_HUNTER_CACHE
+    if _CI_HUNTER_CACHE is None:
+        p = Path(_CI_HUNTER_CACHE_FILE)
+        try:
+            _CI_HUNTER_CACHE = json.loads(p.read_text(encoding="utf-8")) \
+                if p.exists() else {}
+        except Exception:
+            _CI_HUNTER_CACHE = {}
+    return _CI_HUNTER_CACHE
+
+def _hunter_cache_save(domain: str, result: dict) -> None:
+    cache = _hunter_cache()
+    cache[domain] = result
+    try:
+        Path(_CI_HUNTER_CACHE_FILE).write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # cache is best-effort; never fail the run over it
+
+def ci_hunter_account(api_key: str) -> dict:
+    """One-off account check: prints remaining free-tier searches. Cheap, not
+    counted against the search quota."""
     if not api_key or not _CI_HTTP:
         return {}
     session = _ci_session()
     if session is None:
         return {}
     try:
+        r = session.get(f"{_CI_HUNTER_API}/account",
+                        params={"api_key": api_key}, timeout=10)
+        if r.status_code != 200:
+            return {}
+        d = r.json().get("data", {})
+        reqs = d.get("requests", {}).get("searches", {})
+        used, avail = reqs.get("used"), reqs.get("available")
+        if used is not None and avail is not None:
+            info(f"[CI-HUNTER] plan={d.get('plan_name','?')} "
+                 f"searches used {used}/{avail} this period")
+        return d
+    except Exception:
+        return {}
+
+def ci_query_hunter(domain: str, api_key: str) -> dict:
+    global _CI_HUNTER_QUOTA_EXHAUSTED
+    if not api_key or not _CI_HTTP or not domain:
+        return {}
+
+    domain = domain.strip().lower().replace("www.", "")
+    cache = _hunter_cache()
+    if domain in cache:
+        info(f"[CI-HUNTER] cache hit for {domain} "
+             f"({len(cache[domain].get('emails', []))} emails) — no quota spent")
+        return cache[domain]
+
+    if _CI_HUNTER_QUOTA_EXHAUSTED:
+        # Already hit 429 this run; don't waste further calls.
+        return {}
+
+    session = _ci_session()
+    if session is None:
+        return {}
+    try:
         r = session.get(
             f"{_CI_HUNTER_API}/domain-search",
-            params={"domain": domain, "api_key": api_key, "limit": 20},
+            # Free tier caps at 10 results/search; request 10 (not 20).
+            params={"domain": domain, "api_key": api_key, "limit": 10},
             timeout=12,
         )
-        # Hunter returns structured errors with a meaningful status code.
         if r.status_code == 401:
             warn("[CI-HUNTER] API key rejected (401) — check HUNTER_API_KEY.")
             return {}
         if r.status_code == 429:
-            warn("[CI-HUNTER] rate limit / monthly quota reached (429).")
+            warn("[CI-HUNTER] monthly free-tier quota reached (429). "
+                 "Remaining domains this run will be skipped.")
+            _CI_HUNTER_QUOTA_EXHAUSTED = True
             return {}
         if r.status_code == 422:
-            # Invalid/unsupported domain — not fatal, just skip this one.
+            _hunter_cache_save(domain, {})   # cache the negative to avoid retry
             return {}
         if r.status_code != 200:
             body = ""
@@ -4911,20 +5044,39 @@ def ci_query_hunter(domain: str, api_key: str) -> dict:
                 body = r.text[:120]
             warn(f"[CI-HUNTER] HTTP {r.status_code}: {body}")
             return {}
+
         data = r.json().get("data", {})
-        info(f"[CI-HUNTER] pattern={data.get('pattern','')} "
-        f"| {len(data.get('emails',[]))} emails")
-        return {
-        "pattern": data.get("pattern", ""),
-        "emails":  [
-        {"email":    e.get("value", ""),
-        "first":    e.get("first_name", ""),
-        "last":     e.get("last_name", ""),
-        "position": e.get("position", ""),
-        "confidence": e.get("confidence", 0)}
-        for e in data.get("emails", [])
-        ],
+        emails = []
+        for e in data.get("emails", []):
+            verif = e.get("verification") or {}
+            emails.append({
+                "email":       e.get("value", ""),
+                "first":       e.get("first_name", ""),
+                "last":        e.get("last_name", ""),
+                "position":    e.get("position", ""),
+                "department":  e.get("department", ""),
+                "seniority":   e.get("seniority", ""),
+                "phone":       e.get("phone_number", ""),
+                "linkedin":    e.get("linkedin", ""),
+                "twitter":     e.get("twitter", ""),
+                "confidence":  e.get("confidence", 0),
+                "type":        e.get("type", ""),          # personal / generic
+                "verify_status": verif.get("status", ""),   # valid / accept_all / …
+                "n_sources":   len(e.get("sources", [])),
+            })
+        result = {
+            "pattern":       data.get("pattern", ""),
+            "organization":  data.get("organization", ""),
+            "country":       data.get("country", ""),
+            "disposable":    data.get("disposable", False),
+            "webmail":       data.get("webmail", False),
+            "accept_all":    data.get("accept_all", False),
+            "emails":        emails,
         }
+        _hunter_cache_save(domain, result)
+        info(f"[CI-HUNTER] {domain}: pattern={result['pattern'] or '?'} | "
+             f"{len(emails)} emails | accept_all={result['accept_all']}")
+        return result
     except Exception as exc:
         warn(f"[CI-HUNTER] {exc}")
         return {}
@@ -5293,11 +5445,12 @@ def ci_run_single(kbo: str, domain: str,
     if org.functional_emails:
         detail("functional mailboxes: " + ", ".join(org.functional_emails[:6]))
 
-    # 3 Staatsblad
-    header("[CI] Step 3/9  Staatsblad")
-    sb_names = ci_fetch_staatsblad(kbo, proxies, delay)
-
-    # Seed contact pool
+    # ── Contact discovery: Hunter.io only ─────────────────────────────────
+    # All other person-level sources (Staatsblad, SERP, LinkedIn, EmailFormat,
+    # Infobel, Gouden Gids, RIZIV, VREG, BIPT, Apollo, SMTP verification) have
+    # been removed. The org's security/functional mailbox discovery from step 2
+    # (security.txt, DMARC, etc.) is retained — the CCB disclosure report needs
+    # it to address the right team.
     pool: Dict[str, CIContact] = {}
 
     def _upsert(name: str, role: str, source: str,
@@ -5315,199 +5468,39 @@ def ci_run_single(kbo: str, domain: str,
             c.sources.append(source)
         return c
 
-    for m in kbo_data.get("mandataries", []):
-        _upsert(m["name"], m["role"], "KBO",
-                phone=org.org_phone, phone_type="org")
-    for e in web_data.get("staff", []) + web_data.get("board", []):
-        _upsert(e["name"], e["role"], "website")
-    for e in sb_names:
-        _upsert(e["name"], "", "Staatsblad")
-
-    # 4-7 SERP + LinkedIn per contact
-    header(f"[CI] Step 4-7/9  SERP search + LinkedIn lookup  ({len(pool)} contact(s))")
-    mx_host = _ci_mx_for(domain) if _CI_DNS else None
-
-    # Fetch LinkedIn company page once for the org (not per-contact)
-    li_company_about = ci_fetch_linkedin_company(domain, proxies, delay)
-    if li_company_about:
-        detail(f"company LinkedIn: {li_company_about[:70]}")
-
-    if not pool:
-        detail("no contacts to enrich for this company")
-
-    for k, c in pool.items():
-        detail(f"{c.name} — searching…")
-        # Always generate a search URL — analyst can use it even if automation fails
-        c.linkedin_search_url = _ci_linkedin_search_url(c.name, org.name)
-
-        serp = ci_run_serps(c.name, org.name, domain, proxies, delay)
-        if serp["linkedin_url"] and not c.linkedin_url:
-            c.linkedin_url = serp["linkedin_url"]
-        if serp["emails"] and not c.email:
-            c.email        = serp["emails"][0]
-            c.email_status = "confirmed (SERP)"
-        if serp["phones"] and not c.phone:
-            c.phone      = serp["phones"][0]
-            c.phone_type = "direct"
-        for s in serp["sources"]:
-            if s not in c.sources:
-                c.sources.append(s)
-        if serp["mentions"] and not c.notes:
-            c.notes = serp["mentions"][0]
-
-        # If SERP found nothing, try pub/dir directly
-        if not c.linkedin_url:
-            parts = c.name.split()
-            if len(parts) >= 2:
-                c.linkedin_url = ci_try_linkedin_pubdir(
-                    parts[0], parts[-1], proxies, delay)
-
-        if c.linkedin_url:
-            li = ci_fetch_linkedin(c.linkedin_url, proxies, delay * 0.8)
-            if li.get("role"):
-                c.linkedin_role = li["role"]
-            if li.get("company"):
-                c.notes = (c.notes + f" | LI: {li['role']} @ {li['company']}"
-                           ).strip(" |")
-
-        if not c.email:
-            parts = c.name.split()
-            if len(parts) >= 2:
-                c.email        = _ci_infer_email(parts[0], parts[-1],
-                                                 domain, org.email_pattern)
-                c.email_status = "inferred"
-
-        # Per-contact result: what each source produced
-        serp_hits = []
-        if serp.get("linkedin_url"):
-            serp_hits.append("linkedin")
-        if serp.get("emails"):
-            serp_hits.append("email")
-        if serp.get("phones"):
-            serp_hits.append("phone")
-        serp_summary = "+".join(serp_hits) if serp_hits else "no hits"
-        if c.linkedin_url:
-            li_role = getattr(c, "linkedin_role", "")
-            li_summary = f"profile ({li_role})" if li_role else "profile"
-        else:
-            li_summary = "search-url only"
-        email_summary = c.email_status or ("none" if not c.email else "found")
-        detail(f"{c.name:<26}  SERP:{serp_summary}  LinkedIn:{li_summary}  "
-               f"email:{email_summary}")
-
-    # 8 External email/contact databases
-    header("[CI] Step 8/9  External databases  "
-           "(EmailFormat · Infobel · Gouden Gids · RIZIV · VREG · BIPT"
-           " · Apollo · Hunter)")
-
-    # 8a EmailFormat — free, no key
-    ef = ci_query_emailformat(domain, proxies, delay)
-    if ef.get("pattern") and not org.email_pattern:
-        org.email_pattern = ef["pattern"]
-    for em in ef.get("emails", []):
-        k = _ci_name_key(em.split("@")[0].replace(".", " "))
-        if k in pool and not pool[k].email:
-            pool[k].email        = em
-            pool[k].email_status = "confirmed (EmailFormat)"
-            if "EmailFormat" not in pool[k].sources:
-                pool[k].sources.append("EmailFormat")
-
-    # 8b Infobel — free Belgian directory
-    ib = ci_query_infobel(org.name, proxies, delay)
-    if ib.get("phone") and not org.org_phone:
-        org.org_phone = ib["phone"]
-    if ib.get("address") and not org.address:
-        org.address = ib["address"]
-
-    # 8b2 Gouden Gids — Belgian Yellow Pages (always run)
-    gg = ci_query_goudengids(org.name, proxies, delay)
-    if gg.get("phone") and not org.org_phone:
-        org.org_phone = gg["phone"]
-    if gg.get("address") and not org.address:
-        org.address = gg["address"]
-
-    # 8b3 RIZIV — healthcare provider registry
-    # (run for all: KBO alone doesn't tell us the NIS2 sector here,
-    #  so we try it and let the endpoint return empty for non-health orgs)
-    rz = ci_query_riziv(org.name, kbo, proxies, delay)
-    if rz.get("phone") and not org.org_phone:
-        org.org_phone = rz["phone"]
-
-    # 8b4 VREG — Flemish energy regulator
-    vr = ci_query_vreg(org.name, kbo, proxies, delay)
-    if vr.get("phone") and not org.org_phone:
-        org.org_phone = vr["phone"]
-
-    # 8b5 BIPT — telecom / digital infrastructure regulator
-    bp = ci_query_bipt(org.name, kbo, proxies, delay)
-    if bp.get("phone") and not org.org_phone:
-        org.org_phone = bp["phone"]
-
-    # Propagate org phone to contacts that still have none
-    if org.org_phone:
-        for c in pool.values():
-            if not c.phone:
-                c.phone      = org.org_phone
-                c.phone_type = "org"
-
-    # 8c Apollo — optional key, 150 free credits/month
-    apollo_data = ci_query_apollo(domain, apollo_key)
-    for ap in apollo_data.get("emails", []):
-        name = f"{ap['first']} {ap['last']}".strip()
-        k    = _ci_name_key(name)
-        if k in pool:
-            if ap["email"] and not pool[k].email:
-                pool[k].email        = ap["email"]
-                pool[k].email_status = "confirmed (Apollo)"
-            if ap.get("linkedin") and not pool[k].linkedin_url:
-                pool[k].linkedin_url = ap["linkedin"]
-            if ap.get("position") and not pool[k].role:
-                pool[k].role = ap["position"]
-            if "Apollo" not in pool[k].sources:
-                pool[k].sources.append("Apollo")
-        else:
-            nc = CIContact(name=name, role=ap.get("position", ""),
-                           email=ap["email"],
-                           email_status="confirmed (Apollo)",
-                           linkedin_url=ap.get("linkedin", ""),
-                           sources=["Apollo"])
-            pool[k] = nc
-
-    # 8d Hunter.io — optional key
+    # Hunter.io domain search — the sole contact source.
+    header(f"[CI] Contact discovery  →  Hunter.io  ({domain})")
     hunter = ci_query_hunter(domain, hunter_key)
     if hunter.get("pattern"):
         org.email_pattern = hunter["pattern"] + "@" + domain
     for he in hunter.get("emails", []):
         name = f"{he['first']} {he['last']}".strip()
-        k    = _ci_name_key(name)
-        if k in pool:
-            pool[k].email        = he["email"]
-            pool[k].email_status = "confirmed (Hunter)"
-            if he.get("position") and not pool[k].role:
-                pool[k].role = he["position"]
-            if "Hunter" not in pool[k].sources:
-                pool[k].sources.append("Hunter")
+        if not name:
+            continue
+        c = _upsert(name, he.get("position", ""), "Hunter.io",
+                    phone=he.get("phone", ""),
+                    phone_type="direct" if he.get("phone") else "")
+        c.email        = he["email"]
+        # Reflect Hunter's own verification if present, else confidence.
+        vs = he.get("verify_status", "")
+        if vs == "valid":
+            c.email_status = "confirmed (Hunter)"
+        elif vs in ("accept_all", "webmail", "unknown"):
+            c.email_status = f"hunter-{vs}"
         else:
-            nc = CIContact(name=name, role=he.get("position", ""),
-                           email=he["email"],
-                           email_status="confirmed (Hunter)",
-                           sources=["Hunter.io"])
-            pool[k] = nc
-
-    # 9 SMTP
-    header(f"[CI] Step 9/9  SMTP verify  (MX: {mx_host or 'n/a'})")
-    for c in pool.values():
-        if no_smtp:
-            break
-        if c.email and c.email_status in ("inferred", ""):
-            c.email_status = ci_smtp_verify(c.email, mx_host)
-            info(f"  {c.email:<42} → {c.email_status}")
-            time.sleep(delay * 0.25)
+            c.email_status = "confirmed (Hunter)"
+        c.linkedin_url = he.get("linkedin", "") or c.linkedin_url
+        c.linkedin_role = he.get("seniority", "") or getattr(c, "linkedin_role", "")
+        dept = he.get("department", "")
+        if dept:
+            c.notes = (c.notes + f" | dept: {dept}").strip(" |")
 
     for c in pool.values():
         c.score = ci_score(c)
 
     org.contacts = sorted(pool.values(), key=lambda x: x.score, reverse=True)
+    detail(f"Hunter.io: {len(org.contacts)} contact(s)"
+           + (f", pattern {hunter['pattern']}" if hunter.get("pattern") else ""))
     return org
 
     # ── Contact output helpers ────────────────────────────────────────────
@@ -6640,6 +6633,7 @@ def ci_enrich_from_scan(output_dir: str,
     on the top `contact_limit` companies ordered by finding count.
     """
     header("POST-SCAN CONTACT ENRICHMENT")
+    ci_hunter_account(hunter_key)   # one-off: prints remaining free-tier searches
 
     manifest_path = Path(output_dir) / "nis2_companies_manifest.csv"
     combined_path = Path(output_dir) / "contact_enrichment.csv"
@@ -7671,76 +7665,55 @@ def main():
                        output_dir=args.output_dir,
                        template_checks=template_checks,
                        scanned_hosts=final_urls,
-                       export_xlsx=args.export_xlsx)
+                       export_xlsx=False)
     step_end()
 
-    step_start("Per-company findings reports")
     _lookup, _hidx = load_url_lookup(args.output_dir)
-    findings_reports = write_company_findings_reports(
-        nuclei_output, args.output_dir, _lookup, _hidx)
-    step_end()
-
-    delivered_extra = list(findings_reports)
-    if args.ccb_disclosure:
-        step_start("CCB disclosure reports")
-        delivered_extra += write_ccb_disclosure_reports(
-            nuclei_output, args.output_dir, _lookup, _hidx)
-        step_end()
-    if args.intro_emails:
-        step_start("Intro emails")
-        delivered_extra += write_intro_emails(
-            final_urls, args.output_dir, _lookup, _hidx)
-        step_end()
-    if args.split_by_company:
-        step_start("Split outputs by company")
-        delivered_extra += split_outputs_by_company(
-            args.output_dir, nuclei_output, _lookup, _hidx)
-        step_end()
-
-    # ── Contact enrichment (post-scan) ─────────────────────────────────
     _results_exist = (Path(nuclei_output).exists()
                       and Path(nuclei_output).stat().st_size > 0)
-    if args.enrich_contacts and rc in (0, 130):
-        if rc == 130 and not _results_exist:
-            warn("Scan interrupted before any results were written — "
-                 "skipping contact enrichment. Re-run with --resume to "
-                 "continue scanning, or use --contact-only for a single target.")
-        else:
-            step_start("Contact enrichment")
-            ci_proxies = ({"http":  args.contact_proxy,
-                           "https": args.contact_proxy}
-                          if args.contact_proxy
-                          else {"http": None, "https": None})
-            ci_enrich_from_scan(
-                args.output_dir, nuclei_output,
-                args.contact_limit, args.hunter_key,
-                args.apollo_key,
-                args.serp_delay, args.no_smtp,
-                args.contact_workers, ci_proxies,
-                re_enrich=args.re_enrich)
-            step_end()
 
+    # Contact discovery (Hunter.io only) — runs before the CCB report because
+    # the report reads contact_enrichment.json for the org's security contact.
+    if args.enrich_contacts and rc in (0, 130) and _results_exist:
+        step_start("Contact discovery (Hunter.io)")
+        ci_proxies = ({"http":  args.contact_proxy,
+                       "https": args.contact_proxy}
+                      if args.contact_proxy
+                      else {"http": None, "https": None})
+        ci_enrich_from_scan(
+            args.output_dir, nuclei_output,
+            args.contact_limit, args.hunter_key,
+            args.apollo_key,
+            args.serp_delay, args.no_smtp,
+            args.contact_workers, ci_proxies,
+            re_enrich=args.re_enrich)
+        step_end()
+
+    # The ONLY report outputs: CCB disclosure (companies with findings) and the
+    # separate no-findings folder (companies scanned clean). Findings reports,
+    # intro emails, per-company splits and the aggregate exports are not written.
+    outputs: List[str] = []
     if rc in (0, 130):
-        maybe_deliver_report(
-            output_dir=args.output_dir,
-            nuclei_output=nuclei_output,
-            webhook_url=args.power_automate_webhook,
-            outlook_to=args.outlook_to,
-            outlook_subject=args.outlook_subject,
-            scanned_hosts=final_urls,
-            include_report_files=args.attach_report_files,
-            extra_attachment_paths=delivered_extra,
-            timeout=args.power_automate_timeout,
-        )
+        step_start("CCB disclosure reports")
+        outputs += write_ccb_disclosure_reports(
+            nuclei_output, args.output_dir, _lookup, _hidx)
+        step_end()
+        step_start("No-findings folder")
+        outputs += write_no_findings_folder(
+            final_urls, nuclei_output, args.output_dir, _lookup, _hidx)
+        step_end()
+
+        # Upload only the CCB reports + no-findings folder (the ledger was
+        # already updated and uploaded above). No aggregates, no scan_results.*.
         maybe_upload_to_sharepoint(
             output_dir=args.output_dir,
             nuclei_output=nuclei_output,
             enabled=args.sharepoint_upload,
             target_folder=args.sharepoint_folder,
             scanned_hosts=final_urls,
-            include_report_files=args.attach_report_files,
-            extra_paths=delivered_extra,
-            only_extra_paths=args.split_by_company,
+            include_report_files=False,
+            extra_paths=outputs,
+            only_extra_paths=True,
         )
 
     header("RUN COMPLETE")
